@@ -169,3 +169,12 @@ If you find this work useful, please cite:
   year={2026}
 }
 ```
+
+## Acknowledgements
+
+This codebase builds upon several open-source projects. We thank the authors of:
+
+- [VGGT](https://github.com/facebookresearch/vggt)
+- [FLUX](https://github.com/black-forest-labs/flux)
+- [JiT](https://github.com/LTH14/JiT)
+- [DINO-Foresight](https://github.com/Sta8is/DINO-Foresight)
