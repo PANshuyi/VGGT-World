@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -204,6 +205,8 @@ class Aggregator(nn.Module):
         images = images.view(B * S, C_in, H, W)
         patch_tokens = self.patch_embed(images)
 
+        del images
+
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 
@@ -218,46 +221,334 @@ class Aggregator(nn.Module):
 
         pos = None
         if self.rope is not None:
-            pos = self.position_getter(B * S, H // self.patch_size, W // self.patch_size, device=images.device)
+            patch_h = H // self.patch_size
+            patch_w = W // self.patch_size
+            pos = self.position_getter(B * S, patch_h, patch_w, device="cuda")
 
         if self.patch_start_idx > 0:
             # do not use position embedding for special tokens (camera and register tokens)
             # so set pos to 0 for the special tokens
             pos = pos + 1
-            pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to(images.device).to(pos.dtype)
+            pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to("cuda").to(pos.dtype)
             pos = torch.cat([pos_special, pos], dim=1)
-
+            del pos_special
+        
         # update P because we added special tokens
         _, P, C = tokens.shape
 
         frame_idx = 0
         global_idx = 0
         output_list = []
+        block4DPT_idx = [4, 11, 17, 23]
 
-        for _ in range(self.aa_block_num):
+        for block_num in range(self.aa_block_num):
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+            need_intermediates = True if block_num in block4DPT_idx else False
+            if block_num % 1 == 0:
+                # Clean up RoPE cache to prevent accumulation
+                if hasattr(self, "rope") and self.rope is not None:
+                    if hasattr(self.rope, "frequency_cache"):
+                        self.rope.frequency_cache.clear()
+                # Clean up position cache
+                if (
+                    hasattr(self, "position_getter")
+                    and self.position_getter is not None
+                ):
+                    if hasattr(self.position_getter, "position_cache"):
+                        # Keep only current size cache, clean up others
+                        current_cache = self.position_getter.position_cache.copy()
+                        if (
+                            len(current_cache) > 1
+                        ):  # If there are multiple cache entries
+                            self.position_getter.position_cache.clear()
+                            # Keep only the most recently used one
+                            if current_cache:
+                                key = list(current_cache.keys())[-1]
+                                self.position_getter.position_cache[key] = (
+                                    current_cache[key]
+                                )
+            # Avoid saving block_num to instance variable to reduce references
             for attn_type in self.aa_order:
                 if attn_type == "frame":
-                    tokens, frame_idx, frame_intermediates = self._process_frame_attention(
-                        tokens, B, S, P, C, frame_idx, pos=pos
-                    )
+                    tokens, frame_idx, frame_intermediates = (self._process_frame_attention(
+                            tokens, B, S, P, C, frame_idx, pos=pos,
+                            need_intermediates=need_intermediates,))
                 elif attn_type == "global":
-                    tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos
-                    )
+                    tokens, global_idx, global_intermediates = (self._process_global_attention(
+                            tokens, B, S, P, C, global_idx, pos=pos,
+                            need_intermediates=need_intermediates,))
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
-
-            for i in range(len(frame_intermediates)):
-                # concat frame and global intermediates, [B x S x P x 2C]
-                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
+                
+            if block_num not in block4DPT_idx:
+                if "frame_intermediates" in locals():
+                    del frame_intermediates
+                if "global_intermediates" in locals():
+                    del global_intermediates
+            else:
+                concat_inter = torch.cat(
+                    [frame_intermediates[0].detach(), global_intermediates[0].detach()],
+                    dim=-1,
+                )
                 output_list.append(concat_inter)
+                del concat_inter, frame_intermediates, global_intermediates
 
-        del concat_inter
-        del frame_intermediates
-        del global_intermediates
+        # Do final cleanup before returning
+        del tokens, pos
+        if "pos_special" in locals():
+            del pos_special
+        if "pos_original" in locals():
+            del pos_original
+        torch.cuda.empty_cache()  # Final cleanup
+
+        return output_list, self.patch_start_idx
+    
+    def part1(self, images: torch.Tensor) -> Tuple[List[torch.Tensor], int]:
+        """
+        Args:
+            images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
+                B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+
+        Returns:
+            (list[torch.Tensor], int):
+                The list of outputs from the attention blocks,
+                and the patch_start_idx indicating where patch tokens begin.
+        """
+        B, S, C_in, H, W = images.shape
+
+        if C_in != 3:
+            raise ValueError(f"Expected 3 input channels, got {C_in}")
+
+        # Normalize images and reshape for patch embed
+        images = (images - self._resnet_mean) / self._resnet_std
+
+        # Reshape to [B*S, C, H, W] for patch embedding
+        images = images.view(B * S, C_in, H, W)
+        patch_tokens = self.patch_embed(images)
+
+        del images
+
+        if isinstance(patch_tokens, dict):
+            patch_tokens = patch_tokens["x_norm_patchtokens"]
+
+        _, P, C = patch_tokens.shape
+
+        # Expand camera and register tokens to match batch size and sequence length
+        camera_token = slice_expand_and_flatten(self.camera_token, B, S)
+        register_token = slice_expand_and_flatten(self.register_token, B, S)
+
+        # Concatenate special tokens with patch tokens
+        tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+
+        pos = None
+        if self.rope is not None:
+            pos = self.position_getter(B * S, H // self.patch_size, W // self.patch_size, device="cuda")
+
+        if self.patch_start_idx > 0:
+            # do not use position embedding for special tokens (camera and register tokens)
+            # so set pos to 0 for the special tokens
+            pos = pos + 1
+            pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to("cuda").to(pos.dtype)
+            pos = torch.cat([pos_special, pos], dim=1)
+            del pos_special
+        
+        # update P because we added special tokens
+        _, P, C = tokens.shape
+
+        frame_idx = 0
+        global_idx = 0
+        output_list = []
+        block4DPT_idx = [4]
+
+        for block_num in range(block4DPT_idx[0]+1):
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+            need_intermediates = True if block_num in block4DPT_idx else False
+            if block_num % 1 == 0:
+                # Clean up RoPE cache to prevent accumulation
+                if hasattr(self, "rope") and self.rope is not None:
+                    if hasattr(self.rope, "frequency_cache"):
+                        self.rope.frequency_cache.clear()
+                # Clean up position cache
+                if (
+                    hasattr(self, "position_getter")
+                    and self.position_getter is not None
+                ):
+                    if hasattr(self.position_getter, "position_cache"):
+                        # Keep only current size cache, clean up others
+                        current_cache = self.position_getter.position_cache.copy()
+                        if (
+                            len(current_cache) > 1
+                        ):  # If there are multiple cache entries
+                            self.position_getter.position_cache.clear()
+                            # Keep only the most recently used one
+                            if current_cache:
+                                key = list(current_cache.keys())[-1]
+                                self.position_getter.position_cache[key] = (
+                                    current_cache[key]
+                                )
+            # Avoid saving block_num to instance variable to reduce references
+            for attn_type in self.aa_order:
+                if attn_type == "frame":
+                    tokens, frame_idx, frame_intermediates = (self._process_frame_attention(
+                            tokens, B, S, P, C, frame_idx, pos=pos,
+                            need_intermediates=need_intermediates,))
+                elif attn_type == "global":
+                    tokens, global_idx, global_intermediates = (self._process_global_attention(
+                            tokens, B, S, P, C, global_idx, pos=pos,
+                            need_intermediates=need_intermediates,))
+                else:
+                    raise ValueError(f"Unknown attention type: {attn_type}")
+                
+            if block_num not in block4DPT_idx:
+                if "frame_intermediates" in locals():
+                    del frame_intermediates
+                if "global_intermediates" in locals():
+                    del global_intermediates
+            else:
+                output_list.append(frame_intermediates[0])
+                del frame_intermediates, global_intermediates
+
+        # Do final cleanup before returning
+        del tokens, pos
+        if "pos_special" in locals():
+            del pos_special
+        if "pos_original" in locals():
+            del pos_original
+        torch.cuda.empty_cache()  # Final cleanup
+
         return output_list, self.patch_start_idx
 
-    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
+    def part2(
+        self,
+        gen_layers: List[torch.Tensor],
+        patch_hw: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[List[torch.Tensor], int]: 
+        B, S, P, C = gen_layers[0].shape
+
+        pos = None
+        if self.rope is not None:
+            patch_tokens = P - self.patch_start_idx if self.patch_start_idx > 0 else P
+            if patch_hw is not None:
+                patch_h, patch_w = patch_hw
+                if patch_h * patch_w != patch_tokens:
+                    raise ValueError(
+                        f"patch_hw={patch_hw} does not match patch tokens {patch_tokens} (P={P}, patch_start_idx={self.patch_start_idx})"
+                    )
+            else:
+                patch_h = patch_w = None
+
+            if patch_h is None:
+                cache = getattr(self.position_getter, "position_cache", {})
+                candidates = [(h, w) for (h, w) in cache.keys() if h * w == patch_tokens]
+                if candidates:
+                    candidates.sort(key=lambda hw: abs(hw[0] - hw[1]))
+                    patch_h, patch_w = candidates[0]
+                else:
+                    inferred = int(math.isqrt(patch_tokens))
+                    if inferred * inferred != patch_tokens:
+                        raise ValueError(
+                            f"Invalid patch token count: {patch_tokens} (P={P}, patch_start_idx={self.patch_start_idx})"
+                        )
+                    patch_h = patch_w = inferred
+
+            pos = self.position_getter(B * S, patch_h, patch_w, device="cuda")
+
+        if self.patch_start_idx > 0:
+            pos = pos + 1
+            pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to("cuda").to(pos.dtype)
+            pos = torch.cat([pos_special, pos], dim=1)
+            del pos_special
+        
+
+        frame_idx = 4
+        global_idx = 4
+        output_list = []
+        block4DPT_idx = [4, 11, 17, 23]
+
+        tokens = gen_layers[0]
+
+        for block_num in range(4, self.aa_block_num):
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+            need_intermediates = True if block_num in block4DPT_idx else False
+            if block_num % 1 == 0:
+                # Clean up RoPE cache to prevent accumulation
+                if hasattr(self, "rope") and self.rope is not None:
+                    if hasattr(self.rope, "frequency_cache"):
+                        self.rope.frequency_cache.clear()
+                # Clean up position cache
+                if (
+                    hasattr(self, "position_getter")
+                    and self.position_getter is not None
+                ):
+                    if hasattr(self.position_getter, "position_cache"):
+                        # Keep only current size cache, clean up others
+                        current_cache = self.position_getter.position_cache.copy()
+                        if (
+                            len(current_cache) > 1
+                        ):  # If there are multiple cache entries
+                            self.position_getter.position_cache.clear()
+                            # Keep only the most recently used one
+                            if current_cache:
+                                key = list(current_cache.keys())[-1]
+                                self.position_getter.position_cache[key] = (
+                                    current_cache[key]
+                                )
+            # Avoid saving block_num to instance variable to reduce references
+            for attn_type in self.aa_order:
+                if attn_type == "frame" and block_num > 4:
+                    tokens, frame_idx, frame_intermediates = (self._process_frame_attention(
+                            tokens, B, S, P, C, frame_idx, pos=pos,
+                            need_intermediates=need_intermediates,))
+                elif attn_type == "frame" and block_num <= 4:
+                    frame_idx += 1
+                elif attn_type == "global":
+                    tokens, global_idx, global_intermediates = (self._process_global_attention(
+                            tokens, B, S, P, C, global_idx, pos=pos,
+                            need_intermediates=need_intermediates,))
+                else:
+                    raise ValueError(f"Unknown attention type: {attn_type}")
+                
+            if block_num not in block4DPT_idx:
+                if "frame_intermediates" in locals():
+                    del frame_intermediates
+                if "global_intermediates" in locals():
+                    del global_intermediates
+            else:
+                if block_num > 4:
+                    concat_inter = torch.cat(
+                        [frame_intermediates[0].detach(), global_intermediates[0].detach()],
+                        dim=-1,
+                    )
+                    if concat_inter.dtype != torch.bfloat16:
+                        concat_inter = concat_inter.to(torch.bfloat16)
+                    output_list.append(concat_inter)
+                    del concat_inter, frame_intermediates, global_intermediates
+                elif block_num <= 4:
+                    concat_inter = torch.cat(
+                        [gen_layers[0], global_intermediates[0].detach()],
+                        dim=-1,
+                    )
+                    if concat_inter.dtype != torch.bfloat16:
+                        concat_inter = concat_inter.to(torch.bfloat16)
+                    output_list.append(concat_inter)
+        # Do final cleanup before returning
+        del tokens, pos
+        if "pos_special" in locals():
+            del pos_special
+        if "pos_original" in locals():
+            del pos_original
+        torch.cuda.empty_cache()  # Final cleanup
+
+        return output_list, self.patch_start_idx
+
+
+    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None,need_intermediates=False):
         """
         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
         """
@@ -268,7 +559,7 @@ class Aggregator(nn.Module):
         if pos is not None and pos.shape != (B * S, P, 2):
             pos = pos.view(B, S, P, 2).view(B * S, P, 2)
 
-        intermediates = []
+        intermediates = [] if need_intermediates else None
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
@@ -277,11 +568,12 @@ class Aggregator(nn.Module):
             else:
                 tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
             frame_idx += 1
-            intermediates.append(tokens.view(B, S, P, C))
+            if need_intermediates:
+                intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, need_intermediates=False):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
         """
@@ -291,7 +583,7 @@ class Aggregator(nn.Module):
         if pos is not None and pos.shape != (B, S * P, 2):
             pos = pos.view(B, S, P, 2).view(B, S * P, 2)
 
-        intermediates = []
+        intermediates = [] if need_intermediates else None
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
@@ -300,7 +592,8 @@ class Aggregator(nn.Module):
             else:
                 tokens = self.global_blocks[global_idx](tokens, pos=pos)
             global_idx += 1
-            intermediates.append(tokens.view(B, S, P, C))
+            if need_intermediates:
+                intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, global_idx, intermediates
 
