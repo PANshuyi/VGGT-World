@@ -45,7 +45,7 @@ After downloading, place the `.pt` file locally, e.g. `checkpoints/kitti_checkpo
 
 ## Data Preparation
 
-Please follow [DINO-Foresight](https://github.com/Sta8is/DINO-Foresight) to download and organize the data.
+Please follow [DINO-Foresight](https://github.com/Sta8is/DINO-Foresight) to download and organize the data. Or you can download them [here](https://1drv.ms/f/c/991ebd14386d50f5/IgA0VYpC9c5sQJtzlmQpirC6AfFQgtUhFH_IOe42jTfKm10?e=9Hl92E).
 
 ### KITTI
 
