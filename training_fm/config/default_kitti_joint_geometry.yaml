@@ -58,8 +58,9 @@ data:
           # official VKITTI benchmark split.
           train_scenes: [Scene01, Scene02, Scene06, Scene20]
           val_scenes: [Scene18]
-          # 本次修改：为每个样本预建 stride=1..10 的合法窗口；stride=s 表示相邻物理时刻相隔 s 个原始帧。
-          temporal_strides: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+          # 本次修改：从原 VGGT-World KITTI 评测使用的 stride=2 起步，预建 2..10 的合法窗口。
+          # stride=s 表示相邻物理时刻相隔 s 个原始帧。
+          temporal_strides: [2, 3, 4, 5, 6, 7, 8, 9, 10]
           start_step: 1
           depth_scale: 100.0
           max_depth_m: 80.0
@@ -68,8 +69,8 @@ data:
         history_timesteps: 2
         future_timesteps: 2
         sampling_weight: 1.0
-        # 本次修改：每个训练 batch 均匀随机选择一个 stride，batch 内及所有 DDP rank 保持一致。
-        batch_temporal_strides: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        # 本次修改：每个训练 batch 在 2..10 中均匀随机选择一个 stride，batch 内及所有 DDP rank 保持一致。
+        batch_temporal_strides: [2, 3, 4, 5, 6, 7, 8, 9, 10]
         # 本次修改：固定宽幅 224x448，位于 VGGT 原训练 aspect 范围内并减少驾驶画面的横向裁剪。
         aspect_ratio_range: [0.5, 0.5]
         # Defaults to total image slots (8). Raise this conservative cost or set
@@ -108,8 +109,8 @@ data:
           cameras: [0, 1]
           train_scenes: [Scene01, Scene02, Scene06, Scene20]
           val_scenes: [Scene18]
-          # 本次修改：验证预建同样的 1..10 stride，并由 round-robin sampler 依次覆盖。
-          temporal_strides: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+          # 本次修改：验证预建同样的 2..10 stride，并由 round-robin sampler 依次覆盖。
+          temporal_strides: [2, 3, 4, 5, 6, 7, 8, 9, 10]
           start_step: 1
           depth_scale: 100.0
           max_depth_m: 80.0
@@ -118,8 +119,8 @@ data:
         history_timesteps: 2
         future_timesteps: 2
         sampling_weight: 1.0
-        # 本次修改：验证 batch 内 stride 统一，不同 batch 按 1..10 确定性轮询。
-        batch_temporal_strides: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        # 本次修改：验证 batch 内 stride 统一，不同 batch 按 2..10 确定性轮询。
+        batch_temporal_strides: [2, 3, 4, 5, 6, 7, 8, 9, 10]
         cost_per_sample: 8
         aspect_ratio_range: [0.5, 0.5]
     common_config:
