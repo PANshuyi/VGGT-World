@@ -171,11 +171,13 @@ loss:
   point: null
   track: null
 
-# 本次修改：不冻结 FM、aggregator 和已启用 heads，并用更小学习率进行全模型微调。
+# 本次修改：只冻结 DINOv2 图像 encoder；part1 的 VGGT blocks、part2、FM 和几何 heads 均可训练。
 optim:
-  # All modules that have an enabled loss remain trainable.  The pretrained
-  # joint model uses a much smaller LR than the original FM-only 2e-4 config.
-  frozen_module_names: []
+  # ``aggregator.patch_embed`` is the pretrained DINOv2 ViT image encoder.
+  # It is one component used inside part1, not the whole part1: the subsequent
+  # frame/global blocks and camera/register tokens remain trainable.
+  frozen_module_names:
+    - "aggregator.patch_embed"
   # 本次修改：关闭只跟踪 FM 的旧 EMA，避免验证时混用 EMA-FM 和在线 aggregator/heads。
   # The inherited EMA tracks FM only. Once aggregator/heads are also trainable,
   # that would validate a mixed EMA-FM + online-geometry model; keep a coherent
