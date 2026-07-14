@@ -174,10 +174,21 @@ class TimestepEmbeddings(nn.Module):
 
         return timesteps_emb
 
-def build_ids(B, T, H, W, device):
-    t = torch.arange(T, device=device)[:, None, None].expand(T, H, W)   # [T,H,W]
-    y = torch.arange(H, device=device)[None, :, None].expand(T, H, W)   # [T,H,W]
-    x = torch.arange(W, device=device)[None, None, :].expand(T, H, W)   # [T,H,W]
+# 本次修改：多目槽位共享物理时间轴，并用分数偏移区分同一时刻的左/右目。
+def build_ids(B, T, H, W, device, views_per_timestep: int = 1):
+    if views_per_timestep <= 0:
+        raise ValueError(
+            f"views_per_timestep must be positive, got {views_per_timestep}."
+        )
+    # V=2 maps time-major slots to 0,0.5,1,1.5,... .  V=1 exactly
+    # preserves the pretrained monocular behavior 0,1,2,3,... .
+    slot_positions = torch.arange(T, device=device, dtype=torch.float32)
+    slot_positions = slot_positions / float(views_per_timestep)
+    t = slot_positions[:, None, None].expand(T, H, W)  # [T,H,W]
+    y = torch.arange(H, device=device, dtype=slot_positions.dtype)
+    y = y[None, :, None].expand(T, H, W)  # [T,H,W]
+    x = torch.arange(W, device=device, dtype=slot_positions.dtype)
+    x = x[None, None, :].expand(T, H, W)  # [T,H,W]
 
     ids = torch.stack([t, y, x], dim=-1)   # [T,H,W,3]
     ids = ids.reshape(1, T*H*W, 3).repeat(B, 1, 1)  # [B,N,3]
@@ -200,6 +211,8 @@ class FMConfig:
     n_max: int = 30000
     use_patch_pos: bool = True
     t_frames: int = 2
+    # 本次修改：记录每个物理时间步的相机数，仅影响 RoPE 位置 ID，不增加可学参数。
+    views_per_timestep: int = 1
 
 
 # -------------------------
@@ -207,15 +220,15 @@ class FMConfig:
 # -------------------------
 class Flowmatching(nn.Module):
     """
-    8-layer flow matching.
+    Flow matching over an equal number of condition and target image slots.
 
     Inputs:
-      x_t_layers:  list len=8, each [B, 2, N, 1024]   (noisy state at time t)
-      cond_layers: list len=8, each [B, 2, N, 1024]   (condition from frames 12 split)
+      x_t_layers:  list len=1, each [B, T, N, 1024] (noisy target state)
+      cond_layers: list len=1, each [B, T, N, 1024] (observed condition)
       t: [B] or [B,1] in [0,1]
 
     Output:
-      v_layers: list len=8, each [B, 2, N, 1024]  (velocity in original token space)
+      clean target tokens: [B, T*N, 1024]
     """
     def __init__(self, cfg: FMConfig):
         super().__init__()
@@ -291,19 +304,28 @@ class Flowmatching(nn.Module):
         nn.init.constant_(self.proj_out.weight, 0)
         nn.init.constant_(self.proj_out.bias, 0)        
 
+    # 本次修改：修正返回类型标注，FM forward 返回单个展平的 clean-latent 张量而非列表。
     def forward(
         self,
         x_t_layers: List[torch.Tensor],
         cond_layers: List[torch.Tensor],
         t: torch.Tensor,
         patch_hw: Optional[tuple] = None,
-    ) -> List[torch.Tensor]:
+        views_per_timestep: Optional[int] = None,
+    ) -> torch.Tensor:
         assert len(x_t_layers) == 1 and len(cond_layers) == 1, "Need 1 x layers and 1 cond layers."
 
         x = torch.cat(x_t_layers, dim=2)
         B, T, Ntot, C = x.shape
         assert C == self.cfg.model_dim
         cond = torch.cat(cond_layers, dim=2)
+
+        # 本次修改：对 4 图历史 -> 4 图未来的等长约束给出显式报错，避免在 view 时才出现难定位的 shape 异常。
+        if cond.shape != x.shape:
+            raise ValueError(
+                "FM condition and target must have identical [B,T,N,C] shapes, "
+                f"got condition={tuple(cond.shape)} and target={tuple(x.shape)}."
+            )
 
         hidden_states = x.view(B, T*Ntot, C)
         hidden_length = [T*Ntot] 
@@ -325,13 +347,36 @@ class Flowmatching(nn.Module):
                     f"patch_hw=({H},{W}) does not match patch_per_frame={patch_per_frame}"
                 )
         
+        # 本次修改：允许每个 source bucket 在运行时提供相机路数；仅改变无参数 RoPE ID，不改变 checkpoint。
+        raw_views = (
+            self.cfg.views_per_timestep
+            if views_per_timestep is None
+            else views_per_timestep
+        )
+        runtime_views = int(raw_views)
+        if float(raw_views) != runtime_views or runtime_views <= 0:
+            raise ValueError(
+                "views_per_timestep must be a positive integer, got "
+                f"{raw_views!r}."
+            )
+
+        # 本次修改：patch 和 special token 使用同一套多目时间位置，避免将多路相机误当成完整时间步。
         # patch ids: [B, T*H*W, 3] -> [B,T,H*W,3]
-        patch_ids = build_ids(B, 2*T, H, W, device=x.device)
+        patch_ids = build_ids(
+            B,
+            2*T,
+            H,
+            W,
+            device=x.device,
+            views_per_timestep=runtime_views,
+        )
         patch_ids = patch_ids.view(B, 2*T, H * W, 3)
 
         # special ids: [B,T,5,3]
         special_ids = torch.zeros((B, 2*T, num_special, 3), device=x.device, dtype=patch_ids.dtype)
-        t_ids = torch.arange(2*T, device=x.device, dtype=patch_ids.dtype).view(1, 2*T, 1)  # [1,2T,1]
+        t_ids = torch.arange(2*T, device=x.device, dtype=patch_ids.dtype)
+        t_ids = t_ids / float(runtime_views)
+        t_ids = t_ids.view(1, 2*T, 1)  # [1,2T,1]
         special_ids[..., 0] = t_ids.repeat(B, 1, 1)
 
         # [special + patch]
@@ -383,12 +428,15 @@ class Flowmatching(nn.Module):
 
         return hidden_states
 
+    # 本次修改：FM loss 可选返回可微 clean future latent，供 part2 和几何 loss 继续监督。
     def loss_rectified_multilayer(
         self,
         x1_layers: List[torch.Tensor],
         cond_layers: List[torch.Tensor],
         patch_hw: Optional[tuple] = None,
-    ) -> torch.Tensor:
+        return_x1_pred: bool = False,
+        views_per_timestep: Optional[int] = None,
+    ):
         """
         Rectified flow (Flow Matching) loss in original token space (1024):
           x0 ~ N(0,I)
@@ -402,9 +450,11 @@ class Flowmatching(nn.Module):
         device = x1_layers[0].device
         dtype = x1_layers[0].dtype
 
-        Ns = [N for _ in range(T)]
-        x1_big = x1_layers[0].view(B, T*N, C)
-        cond_big = cond_layers[0].view(B, T*N, C)
+        # 本次修改：用 reshape 展平全部未来帧，同时兼容非连续的 target 时间切片。
+        # ``reshape`` also supports the non-contiguous temporal slice used for
+        # detached future targets.
+        x1_big = x1_layers[0].reshape(B, T*N, C)
+        cond_big = cond_layers[0].reshape(B, T*N, C)
 
         x0_big = torch.randn_like(x1_big)
 
@@ -418,20 +468,36 @@ class Flowmatching(nn.Module):
         x_t_big = ratios * x0_big + (1 - ratios) * x1_big
         v_star_big = (x1_big - x_t_big) / ratios
 
-        x_t_layers = [x_t_big.view(B, T, N, C)]
-        cond_layers = [cond_big.view(B, T, N, C)]
+        x_t_layers = [x_t_big.reshape(B, T, N, C)]
+        cond_layers = [cond_big.reshape(B, T, N, C)]
 
-        ##xpred
-        x_hat_layers = self.forward(x_t_layers, cond_layers, timestep, patch_hw=patch_hw)
-        v_hat_layers = (x_hat_layers - x_t_big) / ratios
-        v_star_layers = list(torch.split(v_star_big, Ns, dim=1))
-        v_hat_layers = list(torch.split(v_hat_layers, Ns, dim=1))
+        # 本次修改：保留 FM forward 的 clean latent 预测张量，不调用 no-grad Euler sampler。
+        # ``forward`` predicts the clean future latent x_1.  Keeping this tensor
+        # differentiable lets the existing VGGT part2/depth heads supervise the
+        # FM prediction directly, without running the no-grad Euler sampler.
+        # 本次修改：把本 batch 的相机路数继续传给 FM RoPE，支持相邻 batch 使用不同 V。
+        x1_pred_big = self.forward(
+            x_t_layers,
+            cond_layers,
+            timestep,
+            patch_hw=patch_hw,
+            views_per_timestep=views_per_timestep,
+        )
+        v_hat_big = (x1_pred_big - x_t_big) / ratios
 
-        loss = 0.0
-        for i in range(len(x1_layers)):
-            loss = loss + F.mse_loss(v_hat_layers[i], v_star_layers[i])
-        return loss / len(x1_layers)
+        # 本次修改：直接对 [B,T*N,C] 计算 MSE，修复原实现只监督第一张未来帧的问题。
+        # Compute the loss over *all* future frames/tokens.  The previous split
+        # loop only consumed the first temporal chunk because this implementation
+        # has one latent level containing T frames.
+        loss = F.mse_loss(v_hat_big, v_star_big)
 
+        # 本次修改：仅联合模式返回 clean latent，旧 FM-only 调用仍只返回标量 loss。
+        if return_x1_pred:
+            x1_pred = x1_pred_big.reshape(B, T, N, C)
+            return loss, x1_pred
+        return loss
+
+    # 本次修改：Euler 推理接收运行时相机数，使验证采样与训练使用完全相同的多目 RoPE 布局。
     @torch.no_grad()
     def sample_euler(
         self,
@@ -439,14 +505,15 @@ class Flowmatching(nn.Module):
         shape_like: torch.Tensor,
         steps: int = 20,
         patch_hw: Optional[tuple] = None,
+        views_per_timestep: Optional[int] = None,
     ) -> List[torch.Tensor]:
         """
         Euler sampling (whole-x):
         dx/dt = v_theta(x,t,cond),  t: 0 -> 1
 
-        cond_layers: len=8, each [B,T,Ni,1024]
+        cond_layers: len=1, each [B,T,Ntot,1024]
         shape_like: [B,T,Ntot,1024]  (overall latent shape)
-        returns: x_layers at t=1, len=8, each [B,T,Ni,1024]
+        returns: legacy per-slot list at t=1, len=T, each [B,1,Ntot,1024]
         """
         with torch.autocast("cuda", dtype=torch.bfloat16):
             assert len(cond_layers) == 1
@@ -474,7 +541,14 @@ class Flowmatching(nn.Module):
                 timestep = self.timesteps_per_stage[t_cur]
                 sigma_cur = self.sigmas_per_stage[t_cur].view(B, 1, 1, 1).clamp_min(1e-4)
                 sigma_next = self.sigmas_per_stage[t_next].view(B, 1, 1, 1)
-                x_hat = self.forward([x_big], cond_layers, timestep, patch_hw=patch_hw)
+                # 本次修改：验证/推理采样与训练使用同一个运行时多相机布局。
+                x_hat = self.forward(
+                    [x_big],
+                    cond_layers,
+                    timestep,
+                    patch_hw=patch_hw,
+                    views_per_timestep=views_per_timestep,
+                )
                 x_hat = x_hat.view(B, T, Ntot, C)
                 step_ratio = ((sigma_cur - sigma_next) / (1-sigma_cur)).clamp(0.0, 1.0)
                 x_big = x_big + step_ratio * (x_hat - x_big)

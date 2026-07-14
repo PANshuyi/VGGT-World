@@ -1,0 +1,242 @@
+# 本次修改：继承原 KITTI 训练配置，本文件只覆盖联合几何微调所需的选项。
+defaults:
+  - default_kitti
+  - _self_
+
+# 本次修改：将实验固定为“2 个时间步×双目 -> 2 个时间步×双目”，并使用新名称避免误恢复旧 2->2 实验。
+# Joint case-1 fine-tuning:
+#   history RGB -> part1 (trainable, no detach)
+#   future target latent -> detach
+#   history + FM future latent -> existing part2/geometry heads
+# Here a "slot" means one camera image, rather than one physical timestamp.
+exp_name: exp_clone_stereo_2t_to_2t_joint_geometry
+
+# 本次修改：记录截图中远端 VKITTI 根目录；若训练节点挂载位置不同，可在命令行覆盖 vkitti_root。
+vkitti_root: /horizon-bucket/carizon_4D_autolabel_jfs6/users/xiaobao.wei/opendataset/jfs/vkitti
+
+# 本次修改：将单 GPU 图像预算提高到 48；每样本 8 张图时动态 batch size 为 floor(48/8)=6。
+# This is an image-slot budget rather than a hard memory guarantee. Jointly
+# trainable aggregator/FM/heads should still be profiled on the target GPU.
+max_img_per_gpu: 48
+accum_steps: 1
+
+# 本次修改：训练/验证均固定读取 8 个图像槽位（4 历史 + 4 未来）并加载全部槽位的深度 GT。
+# Dataset adapter MUST return the same time-major order for every tensor:
+# [t0-L, t0-R, t1-L, t1-R | t2-L, t2-R, t3-L, t3-R].
+# RGB/depth/intrinsics/extrinsics/point_masks must all share this ordering.
+# Following DINO-Foresight's sequence sampling idea, the adapter may randomly
+# choose a start frame and temporal stride, but that one window/stride and every
+# spatial transform must be shared by all cameras and all geometry labels.
+# Do not apply random time reversal for forward prediction unless every pose,
+# target and semantic definition is reversed consistently as well.
+# The new self-contained VKittiStereoDataset reads the screenshot-confirmed
+# SceneXX/clone/frames/{rgb,depth}/Camera_{0,1} layout.  It also requires
+# SceneXX/clone/{intrinsic,extrinsic}.txt and fails clearly if text GT is absent.
+# Source-aware loading injects views/history/future into the adapter, and the
+# Trainer normalizes pose/depth/points jointly before applying geometry loss.
+data:
+  train:
+    # 本次修改：按 source/layout 分桶；同 batch 等长，不同 batch 可使用不同 V 和动态 B。
+    _target_: source_aware_dataloader.SourceAwareDynamicTorchDataset
+    seed: ${seed_value}
+    shuffle: true
+    bucket_sampling: weighted_random
+    batches_per_epoch: ${limit_train_batches}
+    # 本次修改：不再依赖 checkout 中缺失的 data.ComposedDataset；每个 bucket 直接实例化自己的 adapter。
+    dataset: null
+    source_buckets:
+      - name: clone_stereo
+        # 本次修改：首轮仅训练 clone 双目；以后混训时在 source_buckets 下继续增加其他 dataset/layout 即可。
+        dataset:
+          _target_: vkitti_stereo_dataset.VKittiStereoDataset
+          VKitti_DIR: ${vkitti_root}
+          split: train
+          conditions: [clone]
+          cameras: [0, 1]
+          # Scene-level split prevents highly overlapping windows from leaking
+          # between train and validation. This is an experiment split, not an
+          # official VKITTI benchmark split.
+          train_scenes: [Scene01, Scene02, Scene06, Scene20]
+          val_scenes: [Scene18]
+          # 本次修改：为每个样本预建 stride=1..10 的合法窗口；stride=s 表示相邻物理时刻相隔 s 个原始帧。
+          temporal_strides: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+          start_step: 1
+          depth_scale: 100.0
+          max_depth_m: 80.0
+          strict_metadata: true
+        views_per_timestep: 2
+        history_timesteps: 2
+        future_timesteps: 2
+        sampling_weight: 1.0
+        # 本次修改：每个训练 batch 均匀随机选择一个 stride，batch 内及所有 DDP rank 保持一致。
+        batch_temporal_strides: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        # 本次修改：固定宽幅 224x448，位于 VGGT 原训练 aspect 范围内并减少驾驶画面的横向裁剪。
+        aspect_ratio_range: [0.5, 0.5]
+        # Defaults to total image slots (8). Raise this conservative cost or set
+        # batch_size explicitly if profiling shows FM attention needs more memory.
+        cost_per_sample: 8
+    common_config:
+      # Source-aware sampling owns source/index randomness and must not be
+      # overridden by TupleConcatDataset.inside_random.
+      inside_random: false
+      load_depth: true
+      # 本次修改：首轮关闭逐图随机空间/颜色增强；adapter 只做确定性缩放和主点中心裁剪，保证双目几何同步。
+      rescale: true
+      rescale_aug: false
+      img_nums: [8, 8]
+      max_img_per_gpu: 48
+      augs:
+        scales: null
+        aspects: [0.5, 0.5]
+        color_jitter: null
+  val:
+    # 本次修改：验证也使用精确、同 rank 同步的单 bucket 日程和运行时 layout 元数据。
+    _target_: source_aware_dataloader.SourceAwareDynamicTorchDataset
+    seed: ${seed_value}
+    shuffle: false
+    bucket_sampling: round_robin
+    batches_per_epoch: ${limit_val_batches}
+    dataset: null
+    source_buckets:
+      - name: clone_stereo
+        # 本次修改：验证复用同一 adapter 和布局，只切换为完全独立的 Scene18。
+        dataset:
+          _target_: vkitti_stereo_dataset.VKittiStereoDataset
+          VKitti_DIR: ${vkitti_root}
+          split: val
+          conditions: [clone]
+          cameras: [0, 1]
+          train_scenes: [Scene01, Scene02, Scene06, Scene20]
+          val_scenes: [Scene18]
+          # 本次修改：验证预建同样的 1..10 stride，并由 round-robin sampler 依次覆盖。
+          temporal_strides: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+          start_step: 1
+          depth_scale: 100.0
+          max_depth_m: 80.0
+          strict_metadata: true
+        views_per_timestep: 2
+        history_timesteps: 2
+        future_timesteps: 2
+        sampling_weight: 1.0
+        # 本次修改：验证 batch 内 stride 统一，不同 batch 按 1..10 确定性轮询。
+        batch_temporal_strides: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        cost_per_sample: 8
+        aspect_ratio_range: [0.5, 0.5]
+    common_config:
+      inside_random: false
+      load_depth: true
+      rescale: true
+      rescale_aug: false
+      img_nums: [8, 8]
+      max_img_per_gpu: 48
+      augs:
+        scales: null
+        aspects: [0.5, 0.5]
+        color_jitter: null
+
+# 本次修改：FM 的计数单位是图像槽位，因此 4->4 分别表示 2 个时间步的双目图像；同时开启 camera/depth 几何监督。
+model:
+  enable_fm_geometry_supervision: true
+  # 本次修改：固定 2 个历史/2 个未来物理时间步，图像槽位数在运行时按 source 的 V 计算。
+  fm_dynamic_views: true
+  fm_history_timesteps: 2
+  fm_future_timesteps: 2
+  # The following legacy slot values remain as a fallback for old loaders and
+  # do not create parameters or change checkpoint shapes.
+  fm_history_frames: 4
+  fm_future_frames: 4
+  # Fixed C0/C1 ordering maps FM RoPE positions to 0,0.5,1,1.5 | 2,2.5,3,3.5.
+  fm_views_per_timestep: 2
+  enable_camera: true
+  enable_depth: true
+  # 本次修改：adapter 已从 depth+pose 生成 world_points，但首轮先关闭 point loss，隔离并验证 FM+camera+depth 链路。
+  # After one-batch geometry validation, enable_point and loss.point may be
+  # turned on together; enabling only the head is unsafe with DDP.
+  enable_point: false
+  enable_track: false
+
+# 本次修改：设置 FM/几何/历史/未来权重，当前对两个时间段都使用 camera+depth 监督。
+loss:
+  fm_weight: 1.0
+  geometry_weight: 1.0
+  history_weight: 1.0
+  future_weight: 1.0
+  camera:
+    weight: 5.0
+    loss_type: "l1"
+  depth:
+    weight: 1.0
+    gradient_loss_fn: "grad"
+    valid_range: 0.98
+  point: null
+  track: null
+
+# 本次修改：不冻结 FM、aggregator 和已启用 heads，并用更小学习率进行全模型微调。
+optim:
+  # All modules that have an enabled loss remain trainable.  The pretrained
+  # joint model uses a much smaller LR than the original FM-only 2e-4 config.
+  frozen_module_names: []
+  # 本次修改：关闭只跟踪 FM 的旧 EMA，避免验证时混用 EMA-FM 和在线 aggregator/heads。
+  # The inherited EMA tracks FM only. Once aggregator/heads are also trainable,
+  # that would validate a mixed EMA-FM + online-geometry model; keep a coherent
+  # online model instead (full-backbone EMA would consume several extra GB).
+  ema:
+    enabled: false
+    eval_with_ema: false
+  # 本次修改：为所有可训练模块使用统一的低学习率 AdamW。
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1e-5
+    weight_decay: 0.05
+  # 本次修改：将每个可训练模块都纳入梯度裁剪，同时满足 GradientClipper 的全覆盖检查。
+  gradient_clip:
+    _target_: train_utils.gradient_clip.GradientClipper
+    configs:
+      - module_name: ["fm"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["aggregator"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["camera_head"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["depth_head"]
+        max_norm: 1.0
+        norm_type: 2
+  # 本次修改：学习率按 warmup → constant → cosine decay 三阶段调度。
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 1e-7
+              end_value: 1e-5
+            - _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+              value: 1e-5
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: 1e-5
+              end_value: 1e-6
+          lengths: [0.05, 0.90, 0.05]
+          interval_scaling: ["rescaled", "rescaled", "rescaled"]
+
+# 本次修改：分别记录 FM、总几何、历史几何、未来几何和最终总 loss。
+logging:
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+        - train/loss_fm
+        - train/loss_geometry
+        - loss_geometry_history
+        - loss_geometry_future
+    val:
+      keys_to_log:
+        - loss_objective
+
+# 本次修改：首次微调只从预训练 checkpoint 加载模型权重，不继承其旧训练进度。
+checkpoint:
+  # Use the pretrained VGGT-World checkpoint as initialization instead of
+  # resuming its old epoch/scheduler/scaler state.
+  load_weights_only: true

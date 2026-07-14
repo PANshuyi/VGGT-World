@@ -422,11 +422,19 @@ class Aggregator(nn.Module):
 
         return output_list, self.patch_start_idx
 
+    # 本次修改：为 part2 增加可控的中间特征 detach，联合微调时可关闭梯度截断。
     def part2(
         self,
         gen_layers: List[torch.Tensor],
         patch_hw: Optional[Tuple[int, int]] = None,
+        detach_intermediates: bool = True,
     ) -> Tuple[List[torch.Tensor], int]: 
+        """Continue VGGT from the block-4 latent and return DPT features.
+
+        ``detach_intermediates=True`` preserves the original inference behavior.
+        Joint FM/geometry training passes ``False`` so depth/point/camera losses
+        can flow through part2 into the predicted future latent and FM model.
+        """
         B, S, P, C = gen_layers[0].shape
 
         pos = None
@@ -521,8 +529,14 @@ class Aggregator(nn.Module):
                     del global_intermediates
             else:
                 if block_num > 4:
+                    # 本次修改：对 block 11/17/23 的 frame/global 特征统一应用可选 detach。
+                    frame_feature = frame_intermediates[0]
+                    global_feature = global_intermediates[0]
+                    if detach_intermediates:
+                        frame_feature = frame_feature.detach()
+                        global_feature = global_feature.detach()
                     concat_inter = torch.cat(
-                        [frame_intermediates[0].detach(), global_intermediates[0].detach()],
+                        [frame_feature, global_feature],
                         dim=-1,
                     )
                     if concat_inter.dtype != torch.bfloat16:
@@ -530,8 +544,16 @@ class Aggregator(nn.Module):
                     output_list.append(concat_inter)
                     del concat_inter, frame_intermediates, global_intermediates
                 elif block_num <= 4:
+                    # 本次修改：保留 block 4 输入 latent 的梯度，并仅在兼容模式下 detach global 特征。
+                    input_feature = gen_layers[0]
+                    global_feature = global_intermediates[0]
+                    if detach_intermediates:
+                        # Preserve the original part2 behavior: only the global
+                        # intermediate was detached, while the supplied latent
+                        # itself remained differentiable.
+                        global_feature = global_feature.detach()
                     concat_inter = torch.cat(
-                        [gen_layers[0], global_intermediates[0].detach()],
+                        [input_feature, global_feature],
                         dim=-1,
                     )
                     if concat_inter.dtype != torch.bfloat16:

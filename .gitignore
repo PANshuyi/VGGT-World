@@ -103,6 +103,10 @@ dmypy.json
 .prof
 **/tmp/
 
+# macOS metadata
+.DS_Store
+**/.DS_Store
+
 # Legacy VGGT demo artifact
 **/outputs/skyseg.onnx
 skyseg.onnx

@@ -24,15 +24,36 @@ class MultitaskLoss(torch.nn.Module):
     - Point loss
     - Tracking loss (not cleaned yet, dirty code is at the bottom of this file)
     """
-    def __init__(self, camera=None, depth=None, point=None, track=None, **kwargs):
+    # 本次修改：增加 FM/几何/历史/未来四类权重，用于组合联合微调目标。
+    def __init__(
+        self,
+        camera=None,
+        depth=None,
+        point=None,
+        track=None,
+        fm_weight=1.0,
+        geometry_weight=1.0,
+        history_weight=1.0,
+        future_weight=1.0,
+        **kwargs,
+    ):
         super().__init__()
         # Loss configuration dictionaries for each task
         self.camera = camera
         self.depth = depth
         self.point = point
         self.track = track
+        # 本次修改：将联合 loss 权重保存为标量，Trainer 和本类各自负责对应层级的加权。
+        # These weights are consumed by Trainer when combining FM and geometry
+        # objectives.  History/future weights are applied here after each side
+        # has been normalized independently.
+        self.fm_weight = float(fm_weight)
+        self.geometry_weight = float(geometry_weight)
+        self.history_weight = float(history_weight)
+        self.future_weight = float(future_weight)
 
-    def forward(self, predictions, batch) -> torch.Tensor:
+    # 本次修改：将整段预测分为历史和未来两部分，分别计算几何监督。
+    def forward(self, predictions, batch, history_frames=None) -> torch.Tensor:
         """
         Compute the total multi-task loss.
         
@@ -43,18 +64,65 @@ class MultitaskLoss(torch.nn.Module):
         Returns:
             Dict containing individual losses and total objective
         """
-        total_loss = 0
+        # 本次修改：优先使用模型输出中记录的历史帧分界，未提供时兼容旧 loss 路径。
+        if history_frames is None:
+            history_frames = predictions.get("_history_frames", None)
+
+        if history_frames is None:
+            return self._forward_single(predictions, batch)
+
+        sequence_length = _prediction_sequence_length(predictions)
+        if not 0 < history_frames < sequence_length:
+            raise ValueError(
+                f"history_frames must be in [1, {sequence_length - 1}], got {history_frames}."
+            )
+
+        # 本次修改：同步切分 prediction 和 GT batch，避免历史/未来有效像素数差异改变权重。
+        # History and future are sliced and reduced separately so one side does
+        # not dominate merely because it contains more frames/valid pixels.
+        history_predictions = _slice_predictions(predictions, 0, history_frames)
+        future_predictions = _slice_predictions(predictions, history_frames, sequence_length)
+        history_batch = _slice_batch(batch, 0, history_frames, sequence_length)
+        future_batch = _slice_batch(batch, history_frames, sequence_length, sequence_length)
+
+        # 本次修改：分别求历史和未来 MultitaskLoss，再按配置权重组合。
+        history_losses = self._forward_single(history_predictions, history_batch)
+        future_losses = self._forward_single(future_predictions, future_batch)
+
+        history_objective = history_losses["objective"]
+        future_objective = future_losses["objective"]
+        total_objective = (
+            self.history_weight * history_objective
+            + self.future_weight * future_objective
+        )
+
+        loss_dict = {
+            **{f"history/{key}": value for key, value in history_losses.items() if key != "objective"},
+            **{f"future/{key}": value for key, value in future_losses.items() if key != "objective"},
+            "loss_geometry_history": history_objective,
+            "loss_geometry_future": future_objective,
+            "objective": total_objective,
+        }
+        return loss_dict
+
+    # 本次修改：提取单个时间切片的通用多任务 loss，供历史/未来复用。
+    def _forward_single(self, predictions, batch):
+        """Compute configured VGGT task losses for one temporal slice."""
+        total_loss = _zero_loss_from_predictions(predictions)
         loss_dict = {}
         
+        # 本次修改：只计算配置中启用且预测存在的任务，并提前检查所需 GT 字段。
         # Camera pose loss - if pose encodings are predicted
-        if "pose_enc_list" in predictions:
+        if self.camera is not None and "pose_enc_list" in predictions:
+            _require_batch_keys(batch, ["point_masks", "extrinsics", "intrinsics", "images"], "camera")
             camera_loss_dict = compute_camera_loss(predictions, batch, **self.camera)   
             camera_loss = camera_loss_dict["loss_camera"] * self.camera["weight"]   
             total_loss = total_loss + camera_loss
             loss_dict.update(camera_loss_dict)
         
         # Depth estimation loss - if depth maps are predicted
-        if "depth" in predictions:
+        if self.depth is not None and "depth" in predictions:
+            _require_batch_keys(batch, ["depths", "point_masks"], "depth")
             depth_loss_dict = compute_depth_loss(predictions, batch, **self.depth)
             depth_loss = depth_loss_dict["loss_conf_depth"] + depth_loss_dict["loss_reg_depth"] + depth_loss_dict["loss_grad_depth"]
             depth_loss = depth_loss * self.depth["weight"]
@@ -62,7 +130,8 @@ class MultitaskLoss(torch.nn.Module):
             loss_dict.update(depth_loss_dict)
 
         # 3D point reconstruction loss - if world points are predicted
-        if "world_points" in predictions:
+        if self.point is not None and "world_points" in predictions:
+            _require_batch_keys(batch, ["world_points", "point_masks"], "point")
             point_loss_dict = compute_point_loss(predictions, batch, **self.point)
             point_loss = point_loss_dict["loss_conf_point"] + point_loss_dict["loss_reg_point"] + point_loss_dict["loss_grad_point"]
             point_loss = point_loss * self.point["weight"]
@@ -70,12 +139,89 @@ class MultitaskLoss(torch.nn.Module):
             loss_dict.update(point_loss_dict)
 
         # Tracking loss - not cleaned yet, dirty code is at the bottom of this file
-        if "track" in predictions:
+        if self.track is not None and "track" in predictions:
             raise NotImplementedError("Track loss is not cleaned up yet")
         
         loss_dict["objective"] = total_loss
 
         return loss_dict
+
+
+# 本次修改：定义需沿时间维切分的预测/GT 字段，并提供配套工具函数。
+_TEMPORAL_PREDICTION_KEYS = {
+    "pose_enc",
+    "depth",
+    "depth_conf",
+    "world_points",
+    "world_points_conf",
+    "track",
+    "vis",
+    "conf",
+}
+
+_TEMPORAL_BATCH_KEYS = {
+    "images",
+    "depths",
+    "extrinsics",
+    "intrinsics",
+    "cam_points",
+    "world_points",
+    "point_masks",
+}
+
+
+def _prediction_sequence_length(predictions):
+    """Infer S from a dense prediction or iterative camera prediction."""
+    for key in ("depth", "world_points", "pose_enc"):
+        value = predictions.get(key)
+        if torch.is_tensor(value) and value.ndim >= 2:
+            return value.shape[1]
+    pose_list = predictions.get("pose_enc_list")
+    if pose_list:
+        return pose_list[-1].shape[1]
+    raise ValueError("Cannot infer temporal length from geometry predictions.")
+
+
+def _slice_predictions(predictions, start, end):
+    """Slice only the sequence dimension while preserving head metadata."""
+    sliced = {}
+    for key, value in predictions.items():
+        if key == "pose_enc_list":
+            sliced[key] = [stage[:, start:end] for stage in value]
+        elif key in _TEMPORAL_PREDICTION_KEYS and torch.is_tensor(value):
+            sliced[key] = value[:, start:end]
+        elif not key.startswith("_"):
+            sliced[key] = value
+    return sliced
+
+
+def _slice_batch(batch, start, end, sequence_length):
+    """Create the matching GT slice for history or future supervision."""
+    sliced = dict(batch)
+    for key in _TEMPORAL_BATCH_KEYS:
+        value = batch.get(key)
+        if torch.is_tensor(value) and value.ndim >= 2 and value.shape[1] == sequence_length:
+            sliced[key] = value[:, start:end]
+    return sliced
+
+
+def _zero_loss_from_predictions(predictions):
+    """Return a graph-connected zero for configs with disabled task heads."""
+    for value in predictions.values():
+        if torch.is_tensor(value):
+            return value.sum() * 0.0
+        if isinstance(value, list) and value and torch.is_tensor(value[0]):
+            return value[0].sum() * 0.0
+    return torch.tensor(0.0)
+
+
+def _require_batch_keys(batch, keys, task_name):
+    missing = [key for key in keys if key not in batch]
+    if missing:
+        raise KeyError(
+            f"{task_name} supervision is enabled but batch is missing {missing}. "
+            "Disable that loss or make the dataset return the required 3D labels."
+        )
 
 
 def compute_camera_loss(
@@ -93,8 +239,11 @@ def compute_camera_loss(
     pred_pose_encodings = pred_dict['pose_enc_list']
     # Binary mask for valid points per frame (B, N, H, W)
     point_masks = batch_data['point_masks']
-    # Only consider frames with enough valid points (>100)
-    valid_frame_mask = point_masks[:, 0].sum(dim=[-1, -2]) > 100
+    # 本次修改：camera 有效性改为逐帧 [B,S] 判断，不再用第 0 帧代表整个 batch。
+    # Only consider individual frames with enough valid geometry (>100).
+    # The previous implementation checked only frame 0 and then masked the
+    # batch dimension, which was incorrect after history/future slicing.
+    valid_frame_mask = point_masks.sum(dim=[-1, -2]) > 100
     # Number of prediction stages
     n_stages = len(pred_pose_encodings)
 
@@ -253,7 +402,16 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
 
     gt_depth = batch['depths']
     gt_depth = check_and_fix_inf_nan(gt_depth, "gt_depth")
-    gt_depth = gt_depth[..., None]              # (B, H, W, 1)
+    # 本次修改：兼容深度 GT 带通道或不带通道的两种 shape，避免重复 unsqueeze。
+    # Datasets in the VGGT family use either [B,S,H,W] or
+    # [B,S,H,W,1].  Normalize only when the channel is absent.
+    if gt_depth.ndim == pred_depth.ndim - 1:
+        gt_depth = gt_depth[..., None]
+    elif gt_depth.ndim != pred_depth.ndim:
+        raise ValueError(
+            f"Depth GT shape {tuple(gt_depth.shape)} is incompatible with "
+            f"prediction shape {tuple(pred_depth.shape)}."
+        )
     gt_depth_mask = batch['point_masks'].clone()   # 3D points derived from depth map, so we use the same mask
 
     if gt_depth_mask.sum() < 100:
@@ -315,7 +473,9 @@ def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0,
     # Initialize gradient loss
     loss_grad = 0
 
+    # 本次修改：将未配置的 gradient_loss_fn 规范为空字符串，避免 None 的成员判断报错。
     # Prepare confidence for gradient loss if needed
+    gradient_loss_fn = gradient_loss_fn or ""
     if "conf" in gradient_loss_fn:
         to_feed_conf = conf.reshape(bb*ss, hh, ww)
     else:
@@ -805,5 +965,3 @@ def sequence_loss(flow_preds, flow_gt, vis, valids, gamma=0.8, vis_aware=False, 
 
     return flow_loss
 '''
-
-

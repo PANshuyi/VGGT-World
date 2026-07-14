@@ -41,6 +41,16 @@ After downloading, place the `.pt` file locally, e.g. `checkpoints/kitti_checkpo
 | `default_kitti.yaml` | KITTI short-sequence (stage 1) |
 | `default_cityscapes.yaml` | Cityscapes short-sequence (stage 1) |
 | `default_cityscapes_stage2.yaml` | Cityscapes mid-sequence (stage 2, autoregressive roll-out) |
+| `default_kitti_joint_geometry.yaml` | Source-aware 2-history → 2-future joint FM + geometry fine-tuning |
+
+The joint-geometry config supports homogeneous source buckets with different
+camera counts and dynamically chooses the per-GPU batch size from an image/cost
+budget. The included `vkitti_stereo_dataset.py` reads ordered Camera_0/Camera_1
+RGB, depth, intrinsics, and extrinsics from the VKITTI `clone` condition. Its
+dataset root and scene split are configured in `default_kitti_joint_geometry.yaml`.
+See
+[VGGT_WORLD_JOINT_FINETUNE_NOTES.md](VGGT_WORLD_JOINT_FINETUNE_NOTES.md) for
+the bucket schema and current limits.
 
 
 ## Data Preparation

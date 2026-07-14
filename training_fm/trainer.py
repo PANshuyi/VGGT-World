@@ -163,13 +163,22 @@ class Trainer:
         if self.mode != "val":
             self.optims = construct_optimizers(self.model, self.optim_conf)
 
-        # Load checkpoint if available or specified
-        if self.checkpoint_conf.resume_checkpoint_path is not None:
-            self._load_resuming_checkpoint(self.checkpoint_conf.resume_checkpoint_path)
-        else:   
-            ckpt_path = get_resume_checkpoint(self.checkpoint_conf.save_dir)
-            if ckpt_path is not None:
-                self._load_resuming_checkpoint(ckpt_path)
+        # 本次修改：优先恢复当前微调目录的 checkpoint；无本地进度时才加载指定预训练权重。
+        # Prefer this run's latest checkpoint so re-running the same fine-tune
+        # command resumes automatically instead of repeatedly reloading the
+        # original pretrained initialization.
+        local_resume_path = get_resume_checkpoint(self.checkpoint_conf.save_dir)
+        if local_resume_path is not None:
+            self._load_resuming_checkpoint(local_resume_path, load_weights_only=False)
+        elif self.checkpoint_conf.resume_checkpoint_path is not None:
+            # An explicitly supplied pretrained checkpoint may be used only as
+            # model initialization for a new fine-tuning run.
+            self._load_resuming_checkpoint(
+                self.checkpoint_conf.resume_checkpoint_path,
+                load_weights_only=bool(
+                    getattr(self.checkpoint_conf, "load_weights_only", False)
+                ),
+            )
 
         # Wrap the model with DDP
         self._setup_ddp_distributed_training(distributed, device)
@@ -254,9 +263,11 @@ class Trainer:
         )
         self.rank = dist.get_rank()
 
-    def _load_resuming_checkpoint(self, ckpt_path: str):
-        """Loads a checkpoint from the given path to resume training."""
-        logging.info(f"Resuming training from {ckpt_path} (rank {self.rank})")
+    # 本次修改：区分“完整断点续训”和“仅加载预训练模型权重”两种 checkpoint 语义。
+    def _load_resuming_checkpoint(self, ckpt_path: str, load_weights_only: bool = False):
+        """Load either full training state or only pretrained model weights."""
+        action = "Initializing model weights" if load_weights_only else "Resuming training"
+        logging.info(f"{action} from {ckpt_path} (rank {self.rank})")
 
         with g_pathmgr.open(ckpt_path, "rb") as f:
             checkpoint = torch.load(f, map_location="cpu")
@@ -269,15 +280,51 @@ class Trainer:
         if self.rank == 0:
             logging.info(f"Model state loaded. Missing keys: {missing or 'None'}. Unexpected keys: {unexpected or 'None'}.")
 
-        # Load optimizer state if available and in training mode
-        if "optimizer" in checkpoint:
-            # logging.info(f"Loading optimizer state dict (rank {self.rank})")
-            # self.optims.optimizer.load_state_dict(checkpoint["optimizer"])
-            logging.info("Skipping optimizer state loading from checkpoint.")
+        # 本次修改：模型权重加载后重建 EMA shadow，避免 EMA 保留加载前的随机 FM 参数。
+        # EMA is initially constructed before checkpoint loading. Rebuild its
+        # shadow from the newly loaded model so a weights-only fine-tune cannot
+        # validate with the random pre-checkpoint FM parameters. A full resume
+        # may overwrite this fresh shadow with its saved EMA state below.
+        if self.ema_enabled:
+            self._setup_ema()
 
-        # Load training progress
+        # 本次修改：预训练初始化只保留 model 权重，epoch/step/optimizer/scaler 从新状态开始。
+        # Fine-tuning should normally start a fresh optimization schedule from
+        # pretrained model weights.  Without this switch, a checkpoint saved at
+        # the last pretraining epoch can make ``run_train`` exit immediately.
+        if load_weights_only:
+            logging.info(
+                "Loaded model weights only; keeping fresh epoch/step, optimizer, "
+                "scaler, and EMA state for fine-tuning."
+            )
+            return
+
+        # 本次修改：真正断点续训时恢复 optimizer 动量，并检查 checkpoint 与当前 optimizer 数量。
+        # A real resume (as opposed to weights-only initialization) must restore
+        # Adam moments as well. ``self.optims`` is a list even for one optimizer,
+        # while checkpoints flatten the common single-optimizer case.
+        if "optimizer" in checkpoint and self.mode != "val":
+            optimizer_states = checkpoint["optimizer"]
+            if not isinstance(optimizer_states, list):
+                optimizer_states = [optimizer_states]
+            if len(optimizer_states) != len(self.optims):
+                raise ValueError(
+                    "Checkpoint optimizer count does not match the current config: "
+                    f"{len(optimizer_states)} vs {len(self.optims)}. Use "
+                    "checkpoint.load_weights_only=true for a new fine-tuning run."
+                )
+            for optim, optimizer_state in zip(self.optims, optimizer_states):
+                optim.optimizer.load_state_dict(optimizer_state)
+            logging.info("Restored optimizer state from checkpoint.")
+
+        # 本次修改：恢复训练进度，同时兼容新 epoch 字段和旧 prev_epoch 字段。
+        # New checkpoints store the next epoch to execute. Older checkpoints in
+        # this repository only contain ``prev_epoch`` (the completed epoch), so
+        # add one when recovering them.
         if "epoch" in checkpoint:
-            self.epoch = checkpoint["epoch"]
+            self.epoch = int(checkpoint["epoch"])
+        elif "prev_epoch" in checkpoint:
+            self.epoch = int(checkpoint["prev_epoch"]) + 1
         self.steps = checkpoint["steps"] if "steps" in checkpoint else {"train": 0, "val": 0}
         self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
 
@@ -479,6 +526,13 @@ class Trainer:
             self.train_dataset = instantiate(self.data_conf.train, _recursive_=False)
             self.train_dataset.seed = self.seed_value
 
+    # 本次修改：source-aware sampler 的所有 rank 必须使用同一个 epoch/layout 日程。
+    def _loader_epoch(self, dataset) -> int:
+        """Return a shared epoch for bucket loaders and legacy rank-offset otherwise."""
+        if getattr(dataset, "synchronize_layout_across_ranks", False):
+            return int(self.epoch)
+        return int(self.epoch + self.distributed_rank)
+
     def _setup_ddp_distributed_training(self, distributed_conf: Dict, device: str):
         """Wraps the model with DistributedDataParallel (DDP)."""
         assert isinstance(self.model, torch.nn.Module)
@@ -516,7 +570,11 @@ class Trainer:
             ):
                 checkpoint_names.append(f"checkpoint_{int(epoch)}")
 
+        # 本次修改：checkpoint 同时保存“下次应执行 epoch”和旧版兼容的 prev_epoch。
         checkpoint_content = {
+            # ``epoch`` is the next epoch to execute after this completed save;
+            # ``prev_epoch`` is retained for compatibility with older loaders.
+            "epoch": epoch + 1,
             "prev_epoch": epoch,
             "steps": self.steps,
             "time_elapsed": self.time_elapsed_meter.val,
@@ -578,8 +636,11 @@ class Trainer:
         """Runs the main training loop over all epochs."""
         while self.epoch < self.max_epochs:
             set_seeds(self.seed_value + self.epoch * 100, self.max_epochs, self.distributed_rank)
-            
-            dataloader = self.train_dataset.get_loader(epoch=int(self.epoch + self.distributed_rank))
+
+            # 本次修改：source-aware loader 在所有 rank 使用相同 epoch，旧 loader 保留原 rank offset 行为。
+            dataloader = self.train_dataset.get_loader(
+                epoch=self._loader_epoch(self.train_dataset)
+            )
             self.train_epoch(dataloader)
             
             # Save checkpoint after each training epoch
@@ -607,7 +668,10 @@ class Trainer:
             logging.info("No validation dataset configured. Skipping validation.")
             return
 
-        dataloader = self.val_dataset.get_loader(epoch=int(self.epoch + self.distributed_rank))
+        # 本次修改：验证与训练复用同一 epoch 规则，保证每个 rank 的 round-robin bucket 日程完全一致。
+        dataloader = self.val_dataset.get_loader(
+            epoch=self._loader_epoch(self.val_dataset)
+        )
         self.val_epoch(dataloader)
         
         del dataloader
@@ -655,7 +719,8 @@ class Trainer:
 
         with self._ema_eval_context():
             for data_iter, batch in enumerate(val_loader):
-                if data_iter > limit_val_batches:
+                # 本次修改：limit 表示精确 batch 数，避免原来的 > 多执行一步。
+                if data_iter >= limit_val_batches:
                     break
                 
                 # measure data loading time
@@ -679,7 +744,14 @@ class Trainer:
                         enabled=self.optim_conf.amp.enabled,
                         dtype=amp_type,
                     ):
-                        out_dir = getattr(self.logging_conf, "val_dump_dir", f"./logs/val/{data_iter}")
+                        # 本次修改：选择验证保存根目录，并为 DDP 各 rank 添加独立子目录避免文件覆盖。
+                        out_dir = getattr(
+                            self.logging_conf,
+                            "val_dump_dir",
+                            f"./logs/val/{data_iter}",
+                        )
+                        if dist.get_world_size() > 1:
+                            out_dir = os.path.join(out_dir, f"rank_{self.rank}")
                         self._validate_and_dump_batch(batch, step=self.epoch, out_dir=out_dir)
 
                 # measure elapsed time
@@ -699,6 +771,80 @@ class Trainer:
 
         return True
 
+    # 本次修改：验证 source bucket 的 layout 元数据在整个 batch 内唯一，并转换为模型关键字参数。
+    @staticmethod
+    def _uniform_batch_layout_value(batch: Mapping, key: str) -> int:
+        if key not in batch:
+            raise KeyError(f"Source-aware batch is missing layout field {key!r}.")
+        value = batch[key]
+        if torch.is_tensor(value):
+            flat = value.detach().reshape(-1)
+            if flat.numel() == 0:
+                raise ValueError(f"Layout field {key!r} is empty.")
+            first = flat[0]
+            if not torch.all(flat == first):
+                raise ValueError(
+                    f"Layout field {key!r} is mixed within one batch: "
+                    f"{flat.cpu().tolist()}. Source buckets must be homogeneous."
+                )
+            value = first.item()
+        if isinstance(value, Sequence) and not isinstance(value, str):
+            if not value:
+                raise ValueError(f"Layout field {key!r} is empty.")
+            if any(item != value[0] for item in value[1:]):
+                raise ValueError(
+                    f"Layout field {key!r} is mixed within one batch: {value}."
+                )
+            value = value[0]
+        if isinstance(value, bool):
+            raise ValueError(f"Layout field {key!r} must be a positive integer.")
+        converted = int(value)
+        if float(value) != converted or converted <= 0:
+            raise ValueError(
+                f"Layout field {key!r} must be a positive integer, got {value!r}."
+            )
+        return converted
+
+    # 本次修改：旧 dataloader 无元数据时返回空字典，保持原固定 2->2/4->4 配置兼容。
+    @classmethod
+    def _fm_layout_from_batch(cls, batch: Mapping) -> Dict[str, int]:
+        layout_keys = (
+            "views_per_timestep",
+            "history_timesteps",
+            "future_timesteps",
+            "num_image_slots",
+        )
+        present = [key in batch for key in layout_keys]
+        if not any(present):
+            return {}
+        if not all(present):
+            missing = [key for key, exists in zip(layout_keys, present) if not exists]
+            raise KeyError(
+                "A source-aware batch must provide all layout fields; missing "
+                f"{missing}."
+            )
+
+        values = {
+            key: cls._uniform_batch_layout_value(batch, key)
+            for key in layout_keys
+        }
+        views = values["views_per_timestep"]
+        history_timesteps = values["history_timesteps"]
+        future_timesteps = values["future_timesteps"]
+        expected_slots = views * (history_timesteps + future_timesteps)
+        actual_slots = int(batch["images"].shape[1])
+        if values["num_image_slots"] != expected_slots or actual_slots != expected_slots:
+            raise ValueError(
+                "Source layout does not match the collated image tensor: "
+                f"V={views}, history_t={history_timesteps}, future_t={future_timesteps}, "
+                f"metadata_S={values['num_image_slots']}, tensor_S={actual_slots}."
+            )
+        return {
+            "views_per_timestep": views,
+            "history_timesteps": history_timesteps,
+            "future_timesteps": future_timesteps,
+        }
+
     def _validate_and_dump_batch(self, batch, step: int, out_dir: str):
         """
         batch: dict, must contain:
@@ -714,27 +860,45 @@ class Trainer:
         images2 = batch["images"]  # [B,T,3,H,W]
         assert images2.ndim == 5, f"Expect [B,T,3,H,W], got {images2.shape}"
 
-        B, T, C, H, W = images2.shape
-        assert T >= 2, f"Need at least 2 frames, got T={T}"
+        _, _, _, H, W = images2.shape
 
-        img12 = images2[:, 0:2]   # [B,1,3,H,W]
-        img34 = images2[:, 2:4]   # [B,1,3,H,W]
+        # 本次修改：验证路径与训练共用模型的图像槽位配置，不再写死 2 历史 + 2 未来。
+        # 本次修改：验证/保存路径读取当前 bucket 的动态 V，而不再固定使用模型初始化值。
+        runtime_layout = self._fm_layout_from_batch(batch)
+        (
+            history_slots,
+            future_slots,
+            total_slots,
+            views_per_timestep,
+            _,
+            _,
+        ) = (
+            model._validate_fm_sequence_layout(images2, **runtime_layout)
+        )
+        images2 = images2[:, :total_slots]
+        history_images = images2[:, :history_slots]
 
-        # 1) condition tokens from frame 0
-        cond_stage_list, patch_start_idx = model.aggregator.part1(img12)
+        # 本次修改：历史条件使用当前 bucket 的 2V 个 time-major 图像槽位。
+        cond_stage_list, patch_start_idx = model.aggregator.part1(history_images)
 
-        # 2) gt tokens from frame 1
-        tgt_stage_list, _ = model.aggregator.part1(images2)  
-        x1_big = torch.cat(tgt_stage_list, dim=1) 
-        x1_big = x1_big[:, 2:4, :, :]           
+        # 本次修改：从完整 teacher 序列中动态取后 2V 个未来 latent，作为采样结果的对照。
+        target_stage_list, _ = model.aggregator.part1(images2)
+        x1_big = target_stage_list[0][:, history_slots:total_slots]
+        if x1_big.shape[1] != future_slots:
+            raise ValueError(
+                "Validation target slice has the wrong number of future image "
+                f"slots: expected {future_slots}, got {x1_big.shape[1]}."
+            )
 
-        B2, T2, Ntot, Ctok = x1_big.shape
+        # 本次修改：FM 以 2V 个历史 latent 一次采样 2V 个未来 latent，并统一使用 FM dtype。
+        dtype_fm = (
+            next(model.fm.parameters()).dtype
+            if (hasattr(model, "fm") and model.fm is not None)
+            else x1_big.dtype
+        )
 
-        # 3) sample tokens for frame 1
-        dtype_fm = next(model.fm.parameters()).dtype if (hasattr(model, "fm") and model.fm is not None) else x1_big.dtype
-
-        cond_z_list = cond_stage_list
-        shape_like = torch.zeros((B2, T2, Ntot, Ctok), device=x1_big.device, dtype=dtype_fm)
+        cond_z_list = [x.to(dtype_fm) for x in cond_stage_list]
+        shape_like = torch.zeros_like(x1_big, dtype=dtype_fm)
 
         patch_size = model.aggregator.patch_size
         if isinstance(patch_size, (tuple, list)):
@@ -748,14 +912,29 @@ class Trainer:
             shape_like=shape_like,
             steps=self.optim_conf.val_sample_steps if hasattr(self.optim_conf, "val_sample_steps") else 50,
             patch_hw=patch_hw,
-        ) 
+            views_per_timestep=views_per_timestep,
+        )
 
-        gen_tokens = torch.cat(gen_layers, dim=1)  # [B,1,Ntot,C]
-        gt_tokens = torch.cat(cond_z_list, dim=1)[:, 0:2, :, :]
-        combo_tokens = torch.cat([gt_tokens, gen_tokens], dim=1)     # [B,4,Ntot,C]
+        # 本次修改：将 2V 个真实历史 latent 与 2V 个预测未来 latent 拼成 4V 槽位，再输入原有 part2。
+        # sample_euler keeps the legacy API of one [B,1,N,C] tensor per
+        # predicted slot, so concatenate all runtime future slots before decoding.
+        gen_tokens = torch.cat(gen_layers, dim=1)
+        history_tokens = cond_z_list[0]
+        if (
+            history_tokens.shape[1] != history_slots
+            or gen_tokens.shape[1] != future_slots
+        ):
+            raise ValueError(
+                "Validation FM output does not match the runtime history/future image-slot "
+                f"layout: history={history_tokens.shape[1]}, future={gen_tokens.shape[1]}."
+            )
+        combo_tokens = torch.cat([history_tokens, gen_tokens], dim=1)
 
         agg_dtype = next(model.aggregator.parameters()).dtype
-        combo_stage_list, _ = model.aggregator.part2([combo_tokens.to(agg_dtype)])
+        combo_stage_list, _ = model.aggregator.part2(
+            [combo_tokens.to(agg_dtype)],
+            patch_hw=patch_hw,
+        )
 
         # decide decode dtype
         if getattr(model, "camera_head", None) is not None:
@@ -774,17 +953,25 @@ class Trainer:
 
         # depth head
         if getattr(model, "depth_head", None) is not None:
-            depth, depth_conf = model.depth_head(combo_stage_list, images=images2, patch_start_idx=patch_start_idx)
+            depth, depth_conf = model.depth_head(
+                combo_stage_list,
+                images=images2,
+                patch_start_idx=patch_start_idx,
+            )
             preds["depth"] = depth.float().cpu().numpy()
             preds["depth_conf"] = depth_conf.float().cpu().numpy()
 
         # point head
         if getattr(model, "point_head", None) is not None:
-            pts3d, pts3d_conf = model.point_head(combo_stage_list, images=images2, patch_start_idx=patch_start_idx)
+            pts3d, pts3d_conf = model.point_head(
+                combo_stage_list,
+                images=images2,
+                patch_start_idx=patch_start_idx,
+            )
             preds["pts3d"] = pts3d.float().cpu().numpy()
             preds["pts3d_conf"] = pts3d_conf.float().cpu().numpy()
 
-        # 5) dump to disk
+        # 本次修改：将 4 个未来槽位的 latent/depth/point 全部保存，文件名显式标记时间步和视角。
         dump_dir = os.path.join(out_dir, f"step_{step:08d}")
         Path(dump_dir).mkdir(parents=True, exist_ok=True)
 
@@ -795,35 +982,62 @@ class Trainer:
             patch_h = patch_w = patch_size
         grid_hw = (H // patch_h, W // patch_w)
 
-        save_feature(x1_big, gen_tokens, dump_dir, grid_hw=grid_hw)
+        save_feature(
+            x1_big,
+            gen_tokens,
+            dump_dir,
+            prefix1="target_future",
+            prefix2="pred_future",
+            grid_hw=grid_hw,
+        )
 
         if "depth" in preds:
             depth = preds["depth"][0]
             np.save(os.path.join(dump_dir, "depth.npy"), depth)
-            d0 = depth[2, :, :, 0]
-            save_depth_png(d0, os.path.join(dump_dir, "depth_t0.png"))
-            if depth.shape[0] > 1:
-                d1 = depth[3, :, :, 0]
-                save_depth_png(d1, os.path.join(dump_dir, "depth_t1.png"))
+            for future_offset, sequence_index in enumerate(
+                range(history_slots, total_slots)
+            ):
+                timestep = history_slots // views_per_timestep + (
+                    future_offset // views_per_timestep
+                )
+                view_index = future_offset % views_per_timestep
+                view_name = (
+                    ("L", "R")[view_index]
+                    if views_per_timestep == 2
+                    else f"view{view_index}"
+                )
+                save_depth_png(
+                    depth[sequence_index, :, :, 0],
+                    os.path.join(dump_dir, f"depth_t{timestep}_{view_name}.png"),
+                )
 
         if "pts3d" in preds:
             pts = preds["pts3d"][0]
             np.save(os.path.join(dump_dir, "pts3d.npy"), pts)
-            p0 = pts[2].reshape(-1, 3)
-            mask = np.isfinite(p0).all(axis=1)
-            p0 = p0[mask]
-            if p0.shape[0] > 200000:
-                idx = np.random.choice(p0.shape[0], 200000, replace=False)
-                p0 = p0[idx]
-            write_ply_xyz(p0, os.path.join(dump_dir, "cloud_t0.ply"))
-            if pts.shape[0] > 1:
-                p1 = pts[3].reshape(-1, 3)
-                mask = np.isfinite(p1).all(axis=1)
-                p1 = p1[mask]
-                if p1.shape[0] > 200000:
-                    idx = np.random.choice(p1.shape[0], 200000, replace=False)
-                    p1 = p1[idx]
-                write_ply_xyz(p1, os.path.join(dump_dir, "cloud_t1.ply"))
+            for future_offset, sequence_index in enumerate(
+                range(history_slots, total_slots)
+            ):
+                timestep = history_slots // views_per_timestep + (
+                    future_offset // views_per_timestep
+                )
+                view_index = future_offset % views_per_timestep
+                view_name = (
+                    ("L", "R")[view_index]
+                    if views_per_timestep == 2
+                    else f"view{view_index}"
+                )
+                points = pts[sequence_index].reshape(-1, 3)
+                valid_mask = np.isfinite(points).all(axis=1)
+                points = points[valid_mask]
+                if points.shape[0] > 200000:
+                    point_indices = np.random.choice(
+                        points.shape[0], 200000, replace=False
+                    )
+                    points = points[point_indices]
+                write_ply_xyz(
+                    points,
+                    os.path.join(dump_dir, f"cloud_t{timestep}_{view_name}.ply"),
+                )
 
         print(f"[VAL] dumped results to: {dump_dir}")
 
@@ -873,7 +1087,8 @@ class Trainer:
             self.gradient_clipper.setup_clipping(self.model)
 
         for data_iter, batch in enumerate(train_loader):
-            if data_iter > limit_train_batches:
+            # 本次修改：source sampler 的 steps_per_epoch 与 Trainer limit 使用同一精确语义。
+            if data_iter >= limit_train_batches:
                 break
             
             # measure data loading time
@@ -903,7 +1118,7 @@ class Trainer:
             )
 
             # compute gradient and do SGD step
-            assert data_iter <= limit_train_batches  # allow for off by one errors
+            assert data_iter < limit_train_batches
             self.where = float(exact_epoch) / self.max_epochs
             
             assert self.where <= 1 + self.EPSILON
@@ -983,7 +1198,16 @@ class Trainer:
         for optim in self.optims:   
             optim.zero_grad(set_to_none=True)
 
+        # 本次修改：拒绝空 accumulation，并统计完整 B，供大小不等的 micro-batch 按样本数加权。
         accum_steps = len(chunked_batches)
+        if accum_steps == 0:
+            raise ValueError("Gradient accumulation received no non-empty chunks.")
+        full_batch_size = sum(
+            int(chunked_batch["images"].shape[0])
+            for chunked_batch in chunked_batches
+        )
+        if full_batch_size <= 0:
+            raise ValueError("Gradient accumulation received an empty batch.")
 
         amp_type = self.optim_conf.amp.amp_dtype
         assert amp_type in ["bfloat16", "float16"], f"Invalid Amp type: {amp_type}"
@@ -1018,9 +1242,14 @@ class Trainer:
                     logging.error(error_msg)
                     return
 
-                loss /= accum_steps
+                # 本次修改：不等大 chunk 按样本数加权；对逐样本 mean 严格等价，对有效像素/帧
+                # mean 则是无丢样本的近似。联合几何训练仍建议 accum_steps=1。
+                # The previous uniform 1/K factor biased splits such as 3+2 and
+                # paired with floor slicing could silently discard samples.
+                backward_weight = batch_size / full_batch_size
+                loss_for_backward = loss * backward_weight
 
-                self.scaler.scale(loss).backward()
+                self.scaler.scale(loss_for_backward).backward()
                 loss_meters[loss_key].update(loss.item(), batch_size)
 
 
@@ -1050,7 +1279,50 @@ class Trainer:
 
     def _process_batch(self, batch: Mapping):      
         if self.data_conf.train.common_config.repeat_batch:
+            # 本次修改：原 repeat_batch 会沿 S 反转整段序列，破坏 time-major 历史/未来和相机顺序。
+            if "views_per_timestep" in batch:
+                raise ValueError(
+                    "repeat_batch is incompatible with source-aware future "
+                    "prediction because it reverses the image-slot dimension. "
+                    "Keep common_config.repeat_batch=false."
+                )
             batch = self._apply_batch_repetition(batch)
+
+        # 本次修改：恢复原 VGGT 的联合几何归一化；以首个槽位相机为参考系，并用同一尺度同步变换 pose/depth/points。
+        # Raw VKITTI extrinsics are global camera-from-world matrices in metric
+        # units.  Camera/depth heads were trained with first-camera-relative,
+        # scale-normalized targets, so all coupled geometry fields must be
+        # transformed together before the batch is copied to the GPU.
+        geometry_keys = (
+            "extrinsics",
+            "cam_points",
+            "world_points",
+            "depths",
+            "point_masks",
+        )
+        present_geometry_keys = [key for key in geometry_keys if key in batch]
+        if present_geometry_keys:
+            missing_geometry_keys = [
+                key for key in geometry_keys if key not in batch
+            ]
+            if missing_geometry_keys:
+                raise KeyError(
+                    "Geometry normalization requires the coupled fields "
+                    f"{geometry_keys}; missing {missing_geometry_keys}."
+                )
+            normalized = normalize_camera_extrinsics_and_points_batch(
+                extrinsics=batch["extrinsics"],
+                cam_points=batch["cam_points"],
+                world_points=batch["world_points"],
+                depths=batch["depths"],
+                point_masks=batch["point_masks"],
+            )
+            (
+                batch["extrinsics"],
+                batch["cam_points"],
+                batch["world_points"],
+                batch["depths"],
+            ) = normalized
         return batch
 
     def _step(self, batch, model: nn.Module, phase: str, loss_meters: dict):
@@ -1060,9 +1332,49 @@ class Trainer:
         Returns:
             A dictionary containing the computed losses.
         """
-        # Forward pass
-        loss, loss_dict = model(batch["images"])
-        log_data = {**loss_dict, **batch}
+        # 本次修改：兼容旧 FM-only 二元输出和联合训练三元输出，并构建最终反向目标。
+        # Forward pass.  Legacy checkpoints return (fm_loss, loss_dict); the
+        # joint geometry mode additionally returns predictions decoded through
+        # the existing VGGT part2 and task heads.
+        # 本次修改：把同 batch 唯一的相机布局传给 VGGT/FM；旧 batch 没有元数据时仍调用原接口。
+        runtime_layout = self._fm_layout_from_batch(batch)
+        model_output = model(batch["images"], **runtime_layout)
+        if len(model_output) == 3:
+            fm_loss, fm_loss_dict, predictions = model_output
+
+            # 本次修改：调用 MultitaskLoss 分别计算历史/未来的 camera/depth/point 几何监督。
+            # MultitaskLoss slices history/future independently, then applies
+            # the configured depth/point/camera supervision to both portions.
+            geometry_loss_dict = self.loss(
+                predictions,
+                batch,
+                history_frames=predictions["_history_frames"],
+            )
+            geometry_loss = geometry_loss_dict["objective"]
+
+            # 本次修改：按配置组合 FM loss 和几何 loss，作为单一的训练总 loss。
+            # Case 1 gradient policy is implemented inside the model: only the
+            # future target latent is detached.  This weighted sum therefore
+            # updates FM, the current part1 path, part2, and enabled heads.
+            loss = (
+                self.loss.fm_weight * fm_loss
+                + self.loss.geometry_weight * geometry_loss
+            )
+            loss_dict = {
+                **fm_loss_dict,
+                **geometry_loss_dict,
+                "train/loss_fm": fm_loss,
+                "train/loss_geometry": geometry_loss,
+                "train/loss_total": loss,
+                "loss_objective": loss,
+                "objective": loss,
+            }
+            log_data = {**loss_dict, **predictions, **batch}
+        else:
+            loss, loss_dict = model_output
+            # Keep the legacy logging key available for existing configs.
+            loss_dict.setdefault("loss_objective", loss)
+            log_data = {**loss_dict, **batch}
 
         self._update_and_log_scalars(log_data, phase, self.steps[phase], loss_meters)
         if (
@@ -1151,11 +1463,28 @@ class Trainer:
 
 
 
+# 本次修改：把一个完整 batch 平衡切成非空 micro-batch，保留余数且不丢弃任何样本。
 def chunk_batch_for_accum_steps(batch: Mapping, accum_steps: int) -> List[Mapping]:
-    """Splits a batch into smaller chunks for gradient accumulation."""
+    """Split a batch into balanced, non-empty chunks without dropping samples."""
+    if accum_steps <= 0:
+        raise ValueError(f"accum_steps must be positive, got {accum_steps}.")
+    batch_size = int(batch["images"].shape[0])
+    if batch_size <= 0:
+        raise ValueError("Cannot split an empty batch.")
     if accum_steps == 1:
         return [batch]
-    return [get_chunk_from_data(batch, i, accum_steps) for i in range(accum_steps)]
+    # 本次修改：K_eff=min(K,B)，余数分给前面的 chunk；B=5,K=2 得到 3+2，B=1 不再产生空块。
+    num_chunks = min(int(accum_steps), batch_size)
+    base_size, remainder = divmod(batch_size, num_chunks)
+    chunks = []
+    start = 0
+    for chunk_id in range(num_chunks):
+        chunk_size = base_size + (1 if chunk_id < remainder else 0)
+        end = start + chunk_size
+        chunks.append(_slice_batch_data(batch, start, end, batch_size))
+        start = end
+    assert start == batch_size
+    return chunks
 
 def is_sequence_of_primitives(data: Any) -> bool:
     """Checks if data is a sequence of primitive types (str, int, float, bool)."""
@@ -1166,34 +1495,28 @@ def is_sequence_of_primitives(data: Any) -> bool:
         and isinstance(data[0], (str, int, float, bool))
     )
 
-def get_chunk_from_data(data: Any, chunk_id: int, num_chunks: int) -> Any:
-    """
-    Recursively splits tensors and sequences within a data structure into chunks.
-
-    Args:
-        data: The data structure to split (e.g., a dictionary of tensors).
-        chunk_id: The index of the chunk to retrieve.
-        num_chunks: The total number of chunks to split the data into.
-
-    Returns:
-        A chunk of the original data structure.
-    """
-    if isinstance(data, torch.Tensor) or is_sequence_of_primitives(data):
-        # either a tensor or a list of primitive objects
-        # assert len(data) % num_chunks == 0
-        start = (len(data) // num_chunks) * chunk_id
-        end = (len(data) // num_chunks) * (chunk_id + 1)
-        return data[start:end]
+# 本次修改：递归仅切 leading dimension 等于 B 的字段，并原样保留 layout 等非 batch 元数据。
+def _slice_batch_data(data: Any, start: int, end: int, batch_size: int) -> Any:
+    """Recursively slice values whose leading dimension is the batch dimension."""
+    if isinstance(data, torch.Tensor):
+        if data.ndim > 0 and len(data) == batch_size:
+            return data[start:end]
+        return data
+    if is_sequence_of_primitives(data):
+        if len(data) == batch_size:
+            return data[start:end]
+        return data
     elif isinstance(data, Mapping):
         return {
-            key: get_chunk_from_data(value, chunk_id, num_chunks)
+            key: _slice_batch_data(value, start, end, batch_size)
             for key, value in data.items()
         }
     elif isinstance(data, str):
-        # NOTE: this is a hack to support string keys in the batch
         return data
     elif isinstance(data, Sequence):
-        return [get_chunk_from_data(value, chunk_id, num_chunks) for value in data]
+        return [
+            _slice_batch_data(value, start, end, batch_size)
+            for value in data
+        ]
     else:
         return data
-
