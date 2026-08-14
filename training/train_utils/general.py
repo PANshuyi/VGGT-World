@@ -61,7 +61,9 @@ def get_resume_checkpoint(checkpoint_save_dir):
     if not g_pathmgr.isdir(checkpoint_save_dir):
         return None
     ckpt_file = os.path.join(checkpoint_save_dir, "checkpoint.pt")
-    if not g_pathmgr.isfile(ckpt_file):
+    # 上次保存若中断在“旧文件移到 .bak”之后，主文件会
+    # 暂时不存在。仍返回主路径，由 checkpoint loader 回退读取 .bak。
+    if not g_pathmgr.isfile(ckpt_file) and not g_pathmgr.isfile(ckpt_file + ".bak"):
         return None
 
     return ckpt_file
@@ -294,6 +296,36 @@ class AverageMeter:
         """Get the running average."""
         return self.avg
 
+
+def distributed_average_meter_values(
+    meters: Mapping[str, "AverageMeter"],
+    device: torch.device,
+) -> Dict[str, float]:
+    """汇总所有 DDP rank 的 AverageMeter，返回全局 sum/count 平均。
+
+    不能直接对各 rank 的 ``meter.avg`` 再取平均：当各 rank
+    处理的有效样本数不同时，那会变成错误的“平均的平均”。
+    """
+    meter_names = list(meters.keys())
+    if not meter_names:
+        return {}
+
+    # float64 降低长验证集累加时的数值误差；第二列是样本计数。
+    statistics = torch.tensor(
+        [[float(meters[name].sum), float(meters[name].count)] for name in meter_names],
+        dtype=torch.float64,
+        device=device,
+    )
+    if is_dist_avail_and_initialized():
+        dist.all_reduce(statistics, op=dist.ReduceOp.SUM)
+
+    averages = {}
+    for row, name in zip(statistics.cpu().tolist(), meter_names):
+        value_sum, value_count = row
+        if value_count > 0:
+            averages[name] = value_sum / value_count
+    return averages
+
 #################
 
 
@@ -365,5 +397,3 @@ def get_rank():
     if not is_dist_avail_and_initialized():
         return 0
     return dist.get_rank()
-
-

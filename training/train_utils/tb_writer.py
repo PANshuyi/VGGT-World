@@ -108,6 +108,11 @@ class TensorBoardLogger:
 
         self._writer.add_scalar(name, data, global_step=step, new_style=True)
 
+    def log_text(self, name: str, text: str, step: int) -> None:
+        """记录固定可视化 probe 的序列名、角色和尺度说明。"""
+        if self._writer:
+            self._writer.add_text(name, str(text), global_step=step)
+
     def log_visuals(
         self,
         name: str,

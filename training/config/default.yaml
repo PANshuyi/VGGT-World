@@ -1,17 +1,20 @@
 defaults:
   - default_dataset.yaml
 
-exp_name: exp001
+exp_name: vggt_finetune_metric_7datasets
 img_size: 518
 num_workers: 8
 seed_value: 42
-accum_steps: 2    # We did not use gradient accumulation in our training, while if you suffer from OOM, you can try to use it.
+# 80 epoch × 1000 batch/epoch = 80K optimizer steps。若改成累积梯度，
+# 要同步增加 epoch，否则 optimizer step 数会变少。
+accum_steps: 1
 patch_size: 14
 val_epoch_freq: 5
 max_img_per_gpu: 48
 
-limit_train_batches: 800
-limit_val_batches: 400
+limit_train_batches: 1000
+# null 表示每次验证遍历 7 个已配置子数据集，不再被 400 batch 截断。
+limit_val_batches: null
 
 
 data:
@@ -28,10 +31,71 @@ data:
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
-        - _target_: data.datasets.co3d.Co3dDataset
+        # 五个真实驾驶数据集复用 DVGT Stage-3 过滤后的 parquet/depth。
+        # 每个 loader 内部再按物理相机拆成独立单路序列。
+        - _target_: data.datasets.open_scene.OpenSceneDataset
           split: train
-          CO3D_DIR: /YOUR/PATH/TO/CO3D
-          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
+          # 直接读取 Stage-3 的 5 个过滤切片，不要求预先再生成
+          # openscene_total_train.parquet；共享 loader 会展开并合并该 glob。
+          parquet_path: ${oc.env:DVGT_META_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/meta_filtered}/openscene_trainval_slice_*.parquet
+          image_root: ${oc.env:DVGT_IMAGE_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/image}
+          align_depth_root: ${oc.env:DVGT_ALIGN_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/align_depth}
+          proj_depth_root: ${oc.env:DVGT_PROJ_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/proj_depth}
+          len_train: 1937600
+          is_metric: True
+        - _target_: data.datasets.waymo.WaymoDataset
+          split: train
+          parquet_path: ${oc.env:DVGT_META_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/meta_filtered}/waymo_train.parquet
+          image_root: ${oc.env:DVGT_IMAGE_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/image}
+          align_depth_root: ${oc.env:DVGT_ALIGN_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/align_depth}
+          proj_depth_root: ${oc.env:DVGT_PROJ_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/proj_depth}
+          len_train: 159600
+          is_metric: True
+        - _target_: data.datasets.ddad.DDADDataset
+          split: train
+          parquet_path: ${oc.env:DVGT_META_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/meta_filtered}/ddad_train.parquet
+          image_root: ${oc.env:DVGT_IMAGE_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/image}
+          align_depth_root: ${oc.env:DVGT_ALIGN_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/align_depth}
+          proj_depth_root: ${oc.env:DVGT_PROJ_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/proj_depth}
+          len_train: 150000
+          is_metric: True
+        - _target_: data.datasets.mvs_synth.MVSSynthDataset
+          split: train
+          MVS_DIR: ${oc.env:MVS_SYNTH_ROOT,/YOUR/PATH/TO/MVS-Synth/GTAV_1080_new}
+          len_train: 144000
+          val_ratio: 0.05  # MapAnything：完整场景固定随机 95% train / 5% val
+          split_seed: 42
+          # 复用 MapAnything 约定：depth/translation 同步 /10 转米，
+          # 并在每帧正有效 depth 上过滤最远 5%。
+          is_metric: True
+          game_units_per_meter: 10.0
+          far_depth_percentile: 95.0
+          min_frame_stride: 2  # 每个样本内固定 stride，训练时在 2~5 间随机选可行值
+          max_frame_stride: 5
+        - _target_: data.datasets.nuscenes.NuScenesDataset
+          split: train
+          parquet_path: ${oc.env:DVGT_META_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/meta_filtered}/nuscene_train.parquet
+          image_root: ${oc.env:DVGT_IMAGE_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/image}
+          align_depth_root: ${oc.env:DVGT_ALIGN_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/align_depth}
+          proj_depth_root: ${oc.env:DVGT_PROJ_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/proj_depth}
+          len_train: 140000
+          is_metric: True
+        - _target_: data.datasets.kitti.KITTIDataset
+          split: train
+          parquet_path: ${oc.env:DVGT_META_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/meta_filtered}/kitti_train.parquet
+          image_root: ${oc.env:DVGT_IMAGE_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/image}
+          align_depth_root: ${oc.env:DVGT_ALIGN_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/align_depth}
+          proj_depth_root: ${oc.env:DVGT_PROJ_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/proj_depth}
+          len_train: 138000
+          is_metric: True
+        - _target_: data.datasets.vkitti.VKittiDataset
+          split: train
+          VKitti_DIR: ${oc.env:VKITTI_ROOT,/YOUR/PATH/TO/VKITTI}
+          len_train: 100000
+          val_scene: Scene20  # Scene20 的全部 condition 和 Camera 0/1 仅用于验证
+          is_metric: True  # loader 已把 cm 转为 m
+          min_frame_stride: 2
+          max_frame_stride: 5
   val:
     _target_: data.dynamic_dataloader.DynamicTorchDataset
     num_workers: ${num_workers}
@@ -43,15 +107,106 @@ data:
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
-        - _target_: data.datasets.co3d.Co3dDataset
-          split: test
-          CO3D_DIR: /YOUR/PATH/TO/CO3D
-          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
+        - _target_: data.datasets.open_scene.OpenSceneDataset
+          split: val
+          parquet_path: ${oc.env:DVGT_META_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/meta_filtered}/openscene_test.parquet
+          image_root: ${oc.env:DVGT_IMAGE_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/image}
+          align_depth_root: ${oc.env:DVGT_ALIGN_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/align_depth}
+          proj_depth_root: ${oc.env:DVGT_PROJ_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/proj_depth}
+          # 与 DVGT 的 OpenScene training-time validation 一致：
+          # 先按 scene 固定抽 200 个，再展开其完整单路相机序列。
+          max_scenes: 200
+          min_scene_frames: 40  # DVGT sample_200 先要求每个 scene 至少 40 个唯一时间帧
+          scene_sample_seed: ${seed_value}
+          is_metric: True
+        - _target_: data.datasets.waymo.WaymoDataset
+          split: val
+          parquet_path: ${oc.env:DVGT_META_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/meta_filtered}/waymo_val.parquet
+          image_root: ${oc.env:DVGT_IMAGE_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/image}
+          align_depth_root: ${oc.env:DVGT_ALIGN_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/align_depth}
+          proj_depth_root: ${oc.env:DVGT_PROJ_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/proj_depth}
+          is_metric: True
+        - _target_: data.datasets.ddad.DDADDataset
+          split: val
+          parquet_path: ${oc.env:DVGT_META_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/meta_filtered}/ddad_val.parquet
+          image_root: ${oc.env:DVGT_IMAGE_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/image}
+          align_depth_root: ${oc.env:DVGT_ALIGN_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/align_depth}
+          proj_depth_root: ${oc.env:DVGT_PROJ_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/proj_depth}
+          is_metric: True
+        - _target_: data.datasets.mvs_synth.MVSSynthDataset
+          split: val
+          MVS_DIR: ${oc.env:MVS_SYNTH_ROOT,/YOUR/PATH/TO/MVS-Synth/GTAV_1080_new}
+          val_ratio: 0.05
+          split_seed: 42  # 必须与训练侧一致，保证两侧互补且不重叠
+          is_metric: True
+          game_units_per_meter: 10.0
+          far_depth_percentile: 95.0
+          validation_frame_stride: 5  # 固定起点0，下采样后切不重叠的最多12帧 clip
+        - _target_: data.datasets.nuscenes.NuScenesDataset
+          split: val
+          parquet_path: ${oc.env:DVGT_META_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/meta_filtered}/nuscene_val.parquet
+          image_root: ${oc.env:DVGT_IMAGE_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/image}
+          align_depth_root: ${oc.env:DVGT_ALIGN_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/align_depth}
+          proj_depth_root: ${oc.env:DVGT_PROJ_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/proj_depth}
+          is_metric: True
+        - _target_: data.datasets.kitti.KITTIDataset
+          split: val
+          parquet_path: ${oc.env:DVGT_META_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/meta_filtered}/kitti_val.parquet
+          image_root: ${oc.env:DVGT_IMAGE_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/image}
+          align_depth_root: ${oc.env:DVGT_ALIGN_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/align_depth}
+          proj_depth_root: ${oc.env:DVGT_PROJ_DEPTH_ROOT,/horizon-bucket/carizon_4D_autolabel_jfs6/users/shuyi.pan/datasets/DVGT-process-data/output/proj_depth}
+          is_metric: True
+        - _target_: data.datasets.vkitti.VKittiDataset
+          split: val
+          VKitti_DIR: ${oc.env:VKITTI_ROOT,/YOUR/PATH/TO/VKITTI}
+          val_scene: Scene20
+          is_metric: True
+          validation_frame_stride: 5  # 固定起点0，下采样后切不重叠的最多12帧 clip
 
 
 logging:
-  log_dir: logs
+  # 不同实验的 TensorBoard、probe 清单、验证指标和 checkpoint
+  # 共用同一 exp_name 根目录，避免并行实验或历史运行相互覆盖。
+  log_dir: logs/${exp_name}
   log_visuals: False
+  # 固定验证探针：首轮验证自动选择并写入
+  # ${logging.log_dir}/visual_probe_manifest.json；断点续训继续使用
+  # 同一批 clip，TensorBoard 才能跨 checkpoint 纵向比较。
+  geometry_visuals:
+    enabled: True
+    metric_scale_factor: ${data.val.common_config.metric_scale_factor}
+    max_frames: 12
+    depth_min_m: 1.0
+    depth_max_m: 100.0
+    error_max_m: 10.0
+    # VGGT confidence 使用 expp1 激活、理论范围为 [1,+inf)。固定色标
+    # 而不按单张图自适应，保证不同 checkpoint 的颜色可以纵向比较。
+    confidence_min: 1.0
+    confidence_max: 10.0
+    bev_x_range_m: [-40.0, 40.0]
+    bev_z_range_m: [-10.0, 100.0]
+    bev_resolution_m: 0.25
+    # 共 11 个前视 probe。OpenScene 特意保留一个正常稠密样本和
+    # 一个 LiDAR fallback；KITTI 左右前向双目各保留一个。
+    probe_plan:
+      openscene: [front_normal, front_fallback]
+      waymo: [front, front]
+      nuscene: [front, front]
+      ddad: [front]
+      kitti: [image_02, image_03]
+      vkitti: [camera_0]
+      mvs_synth: [any]
+  # 正式验证几何指标。该旁路只在 no_grad 验证中读取
+  # detach 后的预测，不改动 forward/loss/backward/优化器。
+  geometry_metrics:
+    enabled: True
+    metric_scale_factor: ${data.val.common_config.metric_scale_factor}
+    # 稠密 518px point map 做全量成对最近邻代价过高。默认每帧
+    # 确定性均匀取 2048 点，保证跨 checkpoint 可比；设为 null
+    # 可关闭取样（只建议小型/稀疏验证集使用）。
+    max_points_per_frame: 2048
+    cdist_chunk_size: 512
+    min_pose_valid_pixels: 100
   log_freq: 1
   log_level_primary: DEBUG
   log_level_secondary: WARNING
@@ -70,6 +225,9 @@ logging:
         - loss_conf_depth
         - loss_reg_depth
         - loss_grad_depth
+        - loss_conf_point
+        - loss_reg_point
+        - loss_grad_point
     val:
       keys_to_log:
         - loss_objective
@@ -80,18 +238,26 @@ logging:
         - loss_conf_depth
         - loss_reg_depth
         - loss_grad_depth
+        - loss_conf_point
+        - loss_reg_point
+        - loss_grad_point
 
 
 
 checkpoint:
-  save_dir: logs/${exp_name}/ckpts
+  save_dir: ${logging.log_dir}/ckpts
   save_freq: 5
-  resume_checkpoint_path: /YOUR/PATH/TO/CKPT
+  # 训练目录中存在 checkpoint.pt（或中断保存留下的 .bak）时，
+  # 优先恢复完整训练状态；仅在不存在时才加载下面的初始 VGGT 权重。
+  auto_resume: True
+  resume_checkpoint_path: ${oc.env:VGGT_CHECKPOINT,/YOUR/PATH/TO/VGGT_CHECKPOINT.pt}
   strict: False
 
 
 loss:
   _target_: loss.MultitaskLoss
+  # 按 is_metric 分流：米制样本直接固定倍率监督，非米制样本尺度不变。
+  metric_aware: True
   camera: 
     weight: 5.0
     loss_type: "l1" # The paper uses smooth l1 loss, but we found l1 loss is more stable than smooth l1 and l2 loss.  
@@ -99,12 +265,10 @@ loss:
     weight: 1.0
     gradient_loss_fn: "grad" 
     valid_range: 0.98
-  point: null
-  # If you want to enable point, use the following config
-  # point: 
-  #   weight: 1.0
-  #   gradient_loss_fn: "normal" 
-  #   valid_range: 0.98
+  point:
+    weight: 1.0
+    gradient_loss_fn: "normal"
+    valid_range: 0.98
   track: null   
 
 
@@ -115,11 +279,13 @@ optim:
 
   optimizer:
     _target_: torch.optim.AdamW
-    lr: 5e-5
+    # 从 VGGT checkpoint 初始化后进行端到端微调；所有可训练参数统一使用 5e-5 峰值学习率。
+    lr: 5.0e-5
     weight_decay: 0.05
 
-  frozen_module_names:
-      - "*aggregator*"  # example, freeze the aggregator
+  # VGGT Aggregator 构造时已把 DINOv2 mask_token 设为 requires_grad=False。
+  # 这里不再冻结 aggregator，其余 backbone/head 端到端微调。
+  frozen_module_names: null
 
   amp:
     enabled: True
@@ -136,17 +302,23 @@ optim:
       - module_name: ["camera"]
         max_norm: 1.0   # feel free to reduce this if you see instabilities
         norm_type: 2
+      # 启用 Point Head 后，point_head 的可训练参数也必须被梯度裁剪规则覆盖；
+      # 否则 GradientClipper 会因存在未覆盖的可训练参数而在训练开始时报错。
+      - module_name: ["point"]
+        max_norm: 1.0
+        norm_type: 2
   options:
     lr:
+      # 不区分 backbone、aggregator 和各个 head：除固有冻结的 mask_token 外统一调度。
       - scheduler:
           _target_: fvcore.common.param_scheduler.CompositeParamScheduler
           schedulers:
             - _target_: fvcore.common.param_scheduler.LinearParamScheduler
-              start_value: 1e-8
-              end_value: 5e-5
+              start_value: 1.0e-8
+              end_value: 5.0e-5
             - _target_: fvcore.common.param_scheduler.CosineParamScheduler
-              start_value: 5e-5
-              end_value: 1e-8
+              start_value: 5.0e-5
+              end_value: 1.0e-8
           lengths: [0.05, 0.95]
           interval_scaling: ['rescaled', 'rescaled']
     weight_decay:
@@ -157,13 +329,13 @@ optim:
 
 
 
-max_epochs: 20
+max_epochs: 80
 
 model:
   _target_: vggt.models.vggt.VGGT
   enable_camera: True
   enable_depth: True
-  enable_point: False
+  enable_point: True
   enable_track: False
 
 

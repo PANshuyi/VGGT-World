@@ -11,9 +11,11 @@ Before you begin, ensure you have completed the following steps:
    pip install -e .
    ```
 
-2. **Prepare the dataset and annotations:**
-   - Download the Co3D dataset from the [official repository](https://github.com/facebookresearch/co3d).
-   - Download the required annotation files from [Hugging Face](https://huggingface.co/datasets/JianyuanWang/co3d_anno/tree/main).
+2. **Prepare the seven driving datasets:**
+   - OpenScene, Waymo, DDAD, nuScenes and KITTI use the filtered parquet,
+     image, aligned-depth and projected-depth outputs produced by DVGT.
+   - MVS-Synth uses the raw `GTAV_1080_new` directory.
+   - VKITTI uses the raw `SceneXX/condition/...` directory.
 
 ## 2. Configuration
 
@@ -21,62 +23,68 @@ After downloading the dataset and annotations, configure the paths in `training/
 
 ### Required Path Configuration
 
-1. Open `training/config/default.yaml`
-2. Update the following paths with your absolute directory paths:
-   - `CO3D_DIR`: Path to your Co3D dataset
-   - `CO3D_ANNOTATION_DIR`: Path to your Co3D annotation files
-   - `resume_checkpoint_path`: Path to your pre-trained VGGT checkpoint
+The default configuration already contains seven datasets. Set these environment
+variables before launching (or replace their defaults in `default.yaml`):
+
+- `DVGT_META_ROOT`, `DVGT_IMAGE_ROOT`, `DVGT_ALIGN_DEPTH_ROOT`,
+  `DVGT_PROJ_DEPTH_ROOT`
+- `MVS_SYNTH_ROOT`, `VKITTI_ROOT`
+- `VGGT_CHECKPOINT`
 
 ### Configuration Example
 
-```yaml
-data:
-  train:
-    dataset:
-      dataset_configs:
-        - _target_: data.datasets.co3d.Co3dDataset
-          split: train
-          CO3D_DIR: /YOUR/PATH/TO/CO3D
-          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
-# ... same for val ...
-
-checkpoint:
-  resume_checkpoint_path: /YOUR/PATH/TO/CKPT
+```bash
+export MVS_SYNTH_ROOT=/path/to/MVS-Synth/GTAV_1080_new
+export VKITTI_ROOT=/path/to/vkitti
+export VGGT_CHECKPOINT=/path/to/model.pt
 ```
 
-## 3. Fine-tuning on Co3D
+## 3. Seven-dataset metric fine-tuning
 
-To fine-tune the provided pre-trained model on the Co3D dataset, run the following command. This example uses 4 GPUs with PyTorch Distributed Data Parallel (DDP):
+Run from the `training/` directory. This example uses 4 GPUs with PyTorch
+Distributed Data Parallel (DDP):
 
 ```bash
 torchrun --nproc_per_node=4 launch.py
 ```
 
-The default configuration in `training/config/default.yaml` is set up for fine-tuning. It automatically resumes from a checkpoint and freezes the model's `aggregator` module during training.
+The configuration loads the official VGGT checkpoint and trains the complete
+Aggregator and Camera/Depth/Point heads. DINOv2's unused `mask_token` remains
+frozen by the model implementation; Track head/loss is disabled.
 
-## 4. Training on Multiple Datasets
+### Automatic resume after interruption
 
-The dataloader supports multiple datasets naturally. For example, if you have downloaded VKitti using `preprocess/vkitti.sh`, you can train on Co3D+VKitti by configuring:
+`checkpoint.auto_resume=True` is enabled by default. On restart, the trainer
+first looks for `logs/${exp_name}/ckpts/checkpoint.pt` and restores model,
+optimizer, AMP scaler, global train/validation steps, elapsed time and the next
+epoch. Only when no training checkpoint exists does it load `VGGT_CHECKPOINT`
+as the initialization weight. If saving was interrupted and the primary file
+is corrupt, the loader automatically falls back to `checkpoint.pt.bak`.
 
-```yaml
-data:
-  train:
-    dataset:
-      _target_: data.composed_dataset.ComposedDataset
-      dataset_configs:
-        - _target_: data.datasets.co3d.Co3dDataset
-          split: train
-          CO3D_DIR: /YOUR/PATH/TO/CO3D
-          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
-          len_train: 100000
-        - _target_: data.datasets.vkitti.VKittiDataset
-          split: train
-          VKitti_DIR: /YOUR/PATH/TO/VKitti
-          len_train: 100000
-          expand_ratio: 8 
-```
+Resume is epoch-level: a job interrupted in the middle of an epoch restarts
+from the latest fully saved epoch. To intentionally start a new experiment,
+use a new `exp_name`/`checkpoint.save_dir`, or launch with
+`checkpoint.auto_resume=False` after confirming that overwriting the existing
+experiment is intended.
 
-The ratio of different datasets can be controlled by setting `len_train`. For example, Co3D with `len_train: 10000` and VKitti with `len_train: 2000` will result in Co3D being sampled five times more frequently than VKitti.
+Metric datasets are converted to metres, multiplied by the fixed DVGT factor
+`0.1`, and supervised directly. MVS-Synth is marked non-metric and uses one
+shared scale-invariant loss space for point/depth/camera translation. Inference
+outputs from the metric branch are converted back to metres by multiplying by
+`10`.
+
+## 4. Multi-dataset sampling
+
+The ratio of datasets is controlled by each loader's virtual `len_train`.
+
+当前默认训练加载器使用 DVGT 风格的分组采样。它先按照各数据集虚拟
+`len_train` 的比例选择一个数据集，再完全从该数据集中构造当前 batch，
+因此同一个 batch 不会混入不同数据集。子数据集内部仍然启用
+`inside_random`，所以增大虚拟长度不需要在内存或磁盘中复制场景元数据。
+
+如果需要退回原始 VGGT 的拼接索引采样器，请删除
+`data.train.sampler_config`，并设置
+`data.train.common_config.grouped_sampling: False`。
 
 ## 5. Common Questions
 
@@ -85,7 +93,7 @@ The ratio of different datasets can be controlled by setting `len_train`. For ex
 If you encounter out-of-memory (OOM) errors on your GPU, consider adjusting the following parameters in `training/config/default.yaml`:
 
 - `max_img_per_gpu`: Reduce this value to decrease the batch size per GPU
-- `accum_steps`: Sets the number of gradient accumulation steps (default is 2). This feature splits batches into smaller chunks to save memory, though it may slightly increase training time. Note that gradient accumulation was not used for the original VGGT model.
+- `accum_steps`: Sets the number of gradient accumulation steps (this configuration uses 1). Increasing it splits batches into smaller chunks, but `max_epochs` must be increased if you want to keep the same number of optimizer updates.
 
 ### Learning Rate Tuning
 
@@ -93,7 +101,8 @@ The main hyperparameter to be careful about is learning rate. Note that learning
 
 ### Tracking Head
 
-The tracking head can slightly improve accuracy but is not necessary. For general cases, especially when GPU resources are limited, we suggest fine-tuning the pre-trained model only with camera and depth heads, which is the setting in `default.yaml`. This will provide good enough results.
+The first version intentionally disables Track Head because these seven loaders
+do not provide track annotations. Camera, Depth and Point heads are enabled.
 
 ### Dataloader Validation
 

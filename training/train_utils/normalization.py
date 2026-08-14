@@ -31,6 +31,9 @@ def normalize_camera_extrinsics_and_points_batch(
     depths: Optional[torch.Tensor] = None,
     scale_by_points: bool = True,
     point_masks: Optional[torch.Tensor] = None,
+    scale_mode: str = "vggt",
+    is_metric: Optional[torch.Tensor] = None,
+    metric_scale_factor: float = 0.1,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Normalize camera extrinsics and corresponding 3D points.
@@ -45,6 +48,12 @@ def normalize_camera_extrinsics_and_points_batch(
         depths: Depth maps of shape (B, S, H, W)
         scale_by_points: Whether to normalize the scale based on point distances
         point_masks: Boolean masks for valid points of shape (B, S, H, W)
+        scale_mode: ``vggt`` 表示沿用原始 VGGT 的逐场景归一化；
+            ``metric_mixed`` 表示使用本项目的混合尺度监督。后者仅对
+            metric 样本乘固定缩放倍率，non-metric 样本的预测/GT
+            尺度对齐在 loss 中一次性完成。
+        is_metric: 每个 batch 样本是否具有可信米制尺度，shape (B,)。
+        metric_scale_factor: DVGT 式固定线性缩放；0.1 即训练空间为真实米制的 1/10。
     
     Returns:
         Tuple containing:
@@ -93,7 +102,36 @@ def normalize_camera_extrinsics_and_points_batch(
         new_world_points = None
 
 
-    if scale_by_points:
+    if scale_mode not in {"vggt", "metric_mixed"}:
+        raise ValueError(f"Unknown scale_mode: {scale_mode}")
+
+    if scale_mode == "metric_mixed":
+        if is_metric is None:
+            raise ValueError("metric_mixed mode requires an is_metric flag for every sample")
+        if metric_scale_factor <= 0:
+            raise ValueError("metric_scale_factor must be positive")
+
+        # 统一在第一帧相机坐标系下监督。metric 样本使用 DVGT
+        # 的固定倍率；non-metric 样本暂时保持原始尺度，以便 loss
+        # 同时用同一个场景尺度处理 point/depth/translation。
+        metric_mask = is_metric.to(device=device, dtype=torch.bool).reshape(B)
+        sample_scale = torch.where(
+            metric_mask,
+            torch.full((B,), float(metric_scale_factor), device=device, dtype=extrinsics.dtype),
+            torch.ones((B,), device=device, dtype=extrinsics.dtype),
+        )
+
+        new_cam_points = cam_points.clone() if cam_points is not None else None
+        new_depths = depths.clone() if depths is not None else None
+        new_extrinsics[:, :, :3, 3] *= sample_scale.view(B, 1, 1)
+        if new_world_points is not None:
+            new_world_points *= sample_scale.view(B, 1, 1, 1, 1)
+        if new_cam_points is not None:
+            new_cam_points *= sample_scale.view(B, 1, 1, 1, 1)
+        if new_depths is not None:
+            new_depths *= sample_scale.view(B, 1, 1, 1)
+
+    elif scale_by_points:
         new_cam_points = cam_points.clone()
         new_depths = depths.clone()
 
@@ -120,7 +158,6 @@ def normalize_camera_extrinsics_and_points_batch(
 
 
     return new_extrinsics, new_cam_points, new_world_points, new_depths
-
 
 
 

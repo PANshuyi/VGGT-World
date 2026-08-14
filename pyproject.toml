@@ -7,6 +7,9 @@ dependencies = [
     "einops",
     "safetensors",
     "opencv-python",
+    # 五个 DVGT 预处理驾驶数据集通过 parquet 读取元数据。
+    "pandas",
+    "pyarrow",
 ]
 name = "vggt"
 requires-python = ">= 3.10"

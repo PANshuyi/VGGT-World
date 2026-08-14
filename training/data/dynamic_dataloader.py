@@ -9,6 +9,7 @@ from typing import Callable, Optional
 from hydra.utils import instantiate
 import random
 import numpy as np
+import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, IterableDataset, Sampler
 from abc import ABC, abstractmethod
 
@@ -28,6 +29,8 @@ class DynamicTorchDataset(ABC):
         persistent_workers: bool = False,
         seed: int = 42,
         max_img_per_gpu: int = 48,
+        sampler_config: Optional[dict] = None,
+        sequential_validation: bool = False,
     ) -> None:
         self.dataset_config = dataset
         self.common_config = common_config
@@ -40,6 +43,8 @@ class DynamicTorchDataset(ABC):
         self.persistent_workers = persistent_workers
         self.seed = seed
         self.max_img_per_gpu = max_img_per_gpu
+        self.sampler_config = sampler_config
+        self.sequential_validation = bool(sequential_validation)
 
         # Instantiate the dataset
         self.dataset = instantiate(dataset, common_config=common_config, _recursive_=False)
@@ -54,27 +59,87 @@ class DynamicTorchDataset(ABC):
         if len(self.image_num_range) != 2 or self.image_num_range[0] < 1 or self.image_num_range[0] > self.image_num_range[1]:
             raise ValueError(f"image_num_range must be [min, max] with 1 <= min <= max, got {self.image_num_range}")
 
-        # Create samplers
-        self.sampler = DynamicDistributedSampler(self.dataset, seed=seed, shuffle=shuffle)
-        self.batch_sampler = DynamicBatchSampler(
-            self.sampler,
-            self.aspect_ratio_range,
-            self.image_num_range,
-            seed=seed,
-            max_img_per_gpu=max_img_per_gpu
-        )
+        # DVGT 式验证：7 个子数据集先由 ComposedDataset 拼接，
+        # 然后按固定顺序、batch_size=1 完整遍历。多卡时仅用
+        # DistributedSampler 切分索引，不随机、不丢样本。
+        if self.sequential_validation:
+            if bool(common_config.training):
+                raise ValueError("sequential_validation is only valid for evaluation")
+            self.batch_sampler = None
+            self.sampler = (
+                DistributedSampler(self.dataset, shuffle=False, drop_last=False)
+                if dist.is_available() and dist.is_initialized()
+                else None
+            )
+
+        # 创建采样器：配置 sampler_config 时启用 DVGT 风格的分组采样，
+        # 即先按虚拟长度选择一个子数据集，再完全从该数据集构造当前 batch。
+        # 未配置 sampler_config 时保留原始 VGGT 采样器，便于兼容旧配置。
+        elif sampler_config is not None:
+            if not hasattr(self.dataset, "base_dataset"):
+                raise TypeError(
+                    "Grouped sampling requires the configured dataset to expose "
+                    "a base_dataset ConcatDataset"
+                )
+            # ComposedDataset.base_dataset 是包含全部子数据集的 ConcatDataset，
+            # 分组采样器需要它来计算每个子数据集的范围和虚拟长度。
+            self.sampler = None
+            self.batch_sampler = instantiate(
+                sampler_config,
+                dataset=self.dataset.base_dataset,
+                aspect_ratio_range=self.aspect_ratio_range,
+                image_num_range=self.image_num_range,
+                max_img_per_gpu=max_img_per_gpu,
+                seed=seed,
+            )
+        else:
+            # 原始 VGGT 路径：在整个拼接后的索引空间上进行动态采样。
+            self.sampler = DynamicDistributedSampler(
+                self.dataset, seed=seed, shuffle=shuffle
+            )
+            self.batch_sampler = DynamicBatchSampler(
+                self.sampler,
+                self.aspect_ratio_range,
+                self.image_num_range,
+                seed=seed,
+                max_img_per_gpu=max_img_per_gpu
+            )
 
     def get_loader(self, epoch):
         print("Building dynamic dataloader with epoch:", epoch)
 
-        # Set the epoch for the sampler
-        self.sampler.set_epoch(epoch)
+        # 验证只设置 DDP 切分器的 epoch，不改变顺序；训练
+        # 则同时兼容新旧 batch sampler。
+        if self.sequential_validation:
+            if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
+                self.sampler.set_epoch(epoch)
+        else:
+            self.batch_sampler.set_epoch(epoch)
         if hasattr(self.dataset, "epoch"):
             self.dataset.epoch = epoch
         if hasattr(self.dataset, "set_epoch"):
             self.dataset.set_epoch(epoch)
 
-        # Create and return the dataloader
+        if self.sequential_validation:
+            return DataLoader(
+                self.dataset,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                sampler=self.sampler,
+                shuffle=False,
+                batch_size=1,
+                drop_last=False,
+                collate_fn=self.collate_fn,
+                persistent_workers=self.persistent_workers,
+                worker_init_fn=get_worker_init_fn(
+                    seed=self.seed,
+                    num_workers=self.num_workers,
+                    epoch=epoch,
+                    worker_init_fn=self.worker_init_fn,
+                ),
+            )
+
+        # Create and return the training/dynamic dataloader
         return DataLoader(
             self.dataset,
             num_workers=self.num_workers,
@@ -89,7 +154,7 @@ class DynamicTorchDataset(ABC):
                 worker_init_fn=self.worker_init_fn,
             ),
         )
-        
+
 
 class DynamicBatchSampler(Sampler):
     """

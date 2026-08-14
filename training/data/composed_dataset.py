@@ -144,6 +144,28 @@ class ComposedDataset(Dataset, ABC):
             "point_masks": point_masks,
         }
 
+        # metric 版需要把数据集的尺度可信性送到 trainer/loss。
+        # 使用布尔标量而非字符串，保证 default_collate 能直接生成 (B,) tensor。
+        if "is_metric" in batch:
+            sample["is_metric"] = torch.tensor(bool(batch["is_metric"]), dtype=torch.bool)
+        if "dataset_name" in batch:
+            sample["dataset_name"] = batch["dataset_name"]
+        # 以下字段只用于验证结果归组和唯一 clip ID，
+        # 不会传入模型或 loss，因此不改变训练数值。
+        for metadata_key in ("scene_name", "camera_name"):
+            if metadata_key in batch:
+                sample[metadata_key] = batch[metadata_key]
+        if "clip_start" in batch:
+            sample["clip_start"] = torch.tensor(
+                int(batch["clip_start"]), dtype=torch.int64
+            )
+        if "use_lidar_proj_depth" in batch:
+            # 每帧是否使用 LiDAR 投影深度，仅用于验证可视化选择
+            # normal/fallback 固定 probe，不进入网络和 loss。
+            sample["use_lidar_proj_depth"] = torch.tensor(
+                batch["use_lidar_proj_depth"], dtype=torch.bool
+            )
+
         # --- Track Processing (if enabled) ---
         if self.load_track:
             if batch["tracks"] is not None:
@@ -210,6 +232,10 @@ class TupleConcatDataset(ConcatDataset):
         # If True, ignores the input index and samples randomly across all datasets
         # This provides an alternative to dataloader shuffling for large datasets
         self.inside_random = common_config.inside_random
+        # 分组采样器已经选定当前 batch 所属的数据集，因此这里不能再在整个
+        # ConcatDataset 中随机替换全局索引。各子数据集内部仍可使用
+        # inside_random，把虚拟索引映射为真实场景。
+        self.grouped_sampling = bool(common_config.get("grouped_sampling", False))
 
     def __getitem__(self, idx):
         """
@@ -232,7 +258,7 @@ class TupleConcatDataset(ConcatDataset):
             idx = idx_tuple[0]  # Extract the sequence index
 
         # Override index with random value if inside_random is enabled
-        if self.inside_random:
+        if self.inside_random and not self.grouped_sampling:
             total_len = self.cumulative_sizes[-1]
             idx = random.randint(0, total_len - 1)
 

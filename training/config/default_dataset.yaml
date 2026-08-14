@@ -8,8 +8,14 @@ data:
     # Shuffling in PyTorch DataLoader can sometimes copy large dicts and exceed CPU memory
     # (see: https://github.com/pytorch/pytorch/issues/13246).
     # To avoid this, set shuffle=False and enable common_config.inside_random=True instead.
-    shuffle: True
+    shuffle: False
     pin_memory: False
+    # DVGT 风格的多数据集混训：一个 batch 只来自一个数据集；子数据集的
+    # 虚拟长度 len_train 决定该数据集被选择的权重。
+    sampler_config:
+      _target_: data.grouped_sampler.GroupedDynamicBatchSampler
+      shuffle: False
+      drop_last: True
     common_config:  # common config for evaluation
       fix_img_num: -1 # -1 means do not fix the number of images
       fix_aspect_ratio: 1.0
@@ -17,6 +23,7 @@ data:
       track_num: 1024
       training: True
       inside_random: True
+      grouped_sampling: True  # 禁止 ConcatDataset 再次随机替换已选中的数据集
       img_size: 224
       patch_size: 14
       rescale: True
@@ -29,6 +36,18 @@ data:
       max_img_per_gpu: 48
       allow_duplicate_img: True
       repeat_batch: False
+      # 面向后续单前视 FM 的相机方向采样。仅影响具有环视相机的
+      # OpenScene/Waymo/nuScenes/DDAD；KITTI、VKITTI、MVS-Synth
+      # 按现有前向单路序列正常采样。组内多相机均匀平分组概率。
+      camera_sampling:
+        enabled: True
+        front: 0.60       # 唯一正前主相机
+        front_side: 0.15  # 左前、右前合计
+        side: 0.15        # 正左、正右合计
+        rear: 0.10        # 左后、正后、右后合计
+      # metric_mixed: 米制数据固定 ×0.1，非米制数据在 loss 中做尺度不变监督。
+      geometry_scale_mode: metric_mixed
+      metric_scale_factor: 0.1
 
       augs:
         cojitter: True
@@ -50,15 +69,21 @@ data:
     # Shuffling in PyTorch DataLoader can sometimes copy large dicts and exceed CPU memory
     # (see: https://github.com/pytorch/pytorch/issues/13246).
     # To avoid this, set shuffle=False and enable common_config.inside_random=True instead.
-    shuffle: True
+    shuffle: False
     pin_memory: False
+    # DVGT 式多验证集：ComposedDataset 拼接全部 val 子集，
+    # 单卡 batch_size=1 且顺序完整遍历；DDP 时只分片不打乱。
+    sequential_validation: True
     common_config:  # common config for evaluation
-      fix_img_num: -1 # -1 means do not fix the number of images
+      # 仍保持当前单路 VGGT 验证上限 12 帧，不直接照搬
+      # DVGT 的 16 时刻 x 多相机输入。固定后每次验证可重复对比。
+      fix_img_num: 12
       fix_aspect_ratio: 1.0
       load_track: False
       track_num: 1024
       training: False
-      inside_random: True
+      inside_random: False
+      grouped_sampling: False
       img_size: 224
       patch_size: 14
       rescale: True
@@ -69,6 +94,11 @@ data:
       load_depth: True
       img_nums: [2, 12]
       allow_duplicate_img: True
+      # 验证集保持数据原本的相机分布，不施加训练时的方向偏置。
+      camera_sampling:
+        enabled: False
+      geometry_scale_mode: metric_mixed
+      metric_scale_factor: 0.1
 
       augs:
         cojitter: False

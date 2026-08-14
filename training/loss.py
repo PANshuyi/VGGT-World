@@ -24,13 +24,24 @@ class MultitaskLoss(torch.nn.Module):
     - Point loss
     - Tracking loss (not cleaned yet, dirty code is at the bottom of this file)
     """
-    def __init__(self, camera=None, depth=None, point=None, track=None, **kwargs):
+    def __init__(
+        self,
+        camera=None,
+        depth=None,
+        point=None,
+        track=None,
+        metric_aware: bool = False,
+        **kwargs,
+    ):
         super().__init__()
         # Loss configuration dictionaries for each task
         self.camera = camera
         self.depth = depth
         self.point = point
         self.track = track
+        # True 时：metric 样本直接监督固定倍率几何；non-metric
+        # 样本的 point/depth/translation 共用同一对场景尺度。
+        self.metric_aware = metric_aware
 
     def forward(self, predictions, batch) -> torch.Tensor:
         """
@@ -43,6 +54,9 @@ class MultitaskLoss(torch.nn.Module):
         Returns:
             Dict containing individual losses and total objective
         """
+        if self.metric_aware:
+            predictions, batch = prepare_mixed_metric_loss_inputs(predictions, batch)
+
         total_loss = 0
         loss_dict = {}
         
@@ -76,6 +90,85 @@ class MultitaskLoss(torch.nn.Module):
         loss_dict["objective"] = total_loss
 
         return loss_dict
+
+
+def _masked_mean_point_distance(points, masks, eps=1e-6):
+    """计算每个样本的有效三维点平均原点距离。
+
+    这与原始 VGGT 使用的场景尺度定义一致，但 metric 版只把它
+    用在 non-metric 样本的 loss 空间。尺度从 point map 计算，
+    所以 depth、point 和 camera translation 不会被三套独立归一化破坏。
+    """
+    distances = torch.linalg.vector_norm(points, dim=-1)
+    valid = masks.to(dtype=distances.dtype)
+    valid_count = valid.sum(dim=(1, 2, 3))
+    mean_distance = (distances * valid).sum(dim=(1, 2, 3)) / valid_count.clamp_min(1.0)
+    # 极端空 mask 样本不应该改变尺度；具体 loss 会因有效点不足而置零。
+    mean_distance = torch.where(valid_count > 0, mean_distance, torch.ones_like(mean_distance))
+    return mean_distance.clamp(min=eps, max=1e6)
+
+
+def _divide_geometry_by_scale(data, scale, *, prediction):
+    """用同一个样本尺度同步处理 point/depth/translation。"""
+    output = dict(data)
+    if "world_points" in data:
+        output["world_points"] = data["world_points"] / scale.view(-1, 1, 1, 1, 1)
+    if prediction:
+        if "depth" in data:
+            output["depth"] = data["depth"] / scale.view(-1, 1, 1, 1, 1)
+        if "pose_enc_list" in data:
+            normalized_pose_list = []
+            for pose_enc in data["pose_enc_list"]:
+                normalized_pose = pose_enc.clone()
+                normalized_pose[..., :3] = normalized_pose[..., :3] / scale.view(-1, 1, 1)
+                normalized_pose_list.append(normalized_pose)
+            output["pose_enc_list"] = normalized_pose_list
+            if normalized_pose_list:
+                output["pose_enc"] = normalized_pose_list[-1]
+    else:
+        if "depths" in data:
+            output["depths"] = data["depths"] / scale.view(-1, 1, 1, 1)
+        if "cam_points" in data:
+            output["cam_points"] = data["cam_points"] / scale.view(-1, 1, 1, 1, 1)
+        if "extrinsics" in data:
+            normalized_extrinsics = data["extrinsics"].clone()
+            normalized_extrinsics[..., :3, 3] = (
+                normalized_extrinsics[..., :3, 3] / scale.view(-1, 1, 1)
+            )
+            output["extrinsics"] = normalized_extrinsics
+    return output
+
+
+def prepare_mixed_metric_loss_inputs(predictions, batch):
+    """Prepare one coherent loss space for mixed metric/non-metric samples.
+
+    * metric=True: trainer 已经把真实几何乘以固定倍率，直接比较；
+    * metric=False: GT 和 prediction 分别除以自己的 point-map 平均距离。
+
+    这个变换只构造 loss 视图，不修改模型原始输出，因此推理时
+    metric 数据仍可用 ``prediction / metric_scale_factor`` 恢复米制。
+    """
+    if "is_metric" not in batch:
+        raise KeyError("metric_aware loss requires batch['is_metric']")
+    if "world_points" not in predictions:
+        raise KeyError("metric_aware loss requires the point head to be enabled")
+
+    metric_mask = batch["is_metric"].to(dtype=torch.bool).reshape(-1)
+    if metric_mask.all():
+        return predictions, batch
+
+    gt_scale = _masked_mean_point_distance(batch["world_points"], batch["point_masks"])
+    pred_scale = _masked_mean_point_distance(predictions["world_points"], batch["point_masks"])
+
+    # metric 样本的除数固定为 1，只对 non-metric 样本做尺度不变化。
+    ones = torch.ones_like(gt_scale)
+    gt_scale = torch.where(metric_mask, ones, gt_scale)
+    pred_scale = torch.where(metric_mask, ones, pred_scale)
+
+    return (
+        _divide_geometry_by_scale(predictions, pred_scale, prediction=True),
+        _divide_geometry_by_scale(batch, gt_scale, prediction=False),
+    )
 
 
 def compute_camera_loss(
@@ -805,5 +898,4 @@ def sequence_loss(flow_preds, flow_gt, vis, valids, gamma=0.8, vis_aware=False, 
 
     return flow_loss
 '''
-
 
